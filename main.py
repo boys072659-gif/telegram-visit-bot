@@ -1,19 +1,12 @@
 """
-결석자 타겟 심방 텔레그램 봇 (관리단계 + 일일 리마인더 포함)
+결석자 타겟 심방 텔레그램 봇 v3
+- 메뉴식 UI (결석자 / 특별관리결석자 / 도움말)
+- 화요일 18시 KST 기준 주차 자동 선택
+- 구역명 정규화 (2-1 ↔ 2팀1)
+- 지역명 또는 구역명 입력 지원
+- 특별관리결석자 시스템 (매주 화요일 19시 KST 리마인더)
+
 Cloud Run (Python 3.11) + python-telegram-bot 20.x + Supabase REST API
-
-기본 명령어:
-  /자문회 강북   → 자문회 강북 지역 결석자 버튼 목록
-  /장년회 강남   → 장년회 강남 지역 결석자 버튼 목록
-  /부녀회 강서   → 부녀회 강서 지역 결석자 버튼 목록
-  /청년회 강동   → 청년회 강동 지역 결석자 버튼 목록
-  /취소          → 현재 입력 중인 작업 취소
-  /도움말        → 사용법 안내
-
-관리단계 명령어 (4회 이상 연속결석자):
-  /관리대책방등록 → 현재 채팅방을 관리대책방으로 등록 (매일 리마인더 수신)
-  /관리대상       → 4회 이상 연속결석자 목록 표시 (단계 체크리스트 관리)
-  /관리확인       → 일일 리마인더 즉시 실행 (테스트용)
 """
 
 import os
@@ -35,14 +28,15 @@ from telegram.ext import (
 )
 
 # ── 환경변수 ──────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
-SUPABASE_URL    = os.environ["SUPABASE_URL"]
-SUPABASE_KEY    = os.environ["SUPABASE_KEY"]
-# 일일 리마인더 실행 시각 (한국 시간 기준) — 기본 09:00
-REMINDER_HOUR   = int(os.environ.get("REMINDER_HOUR", "9"))
-REMINDER_MIN    = int(os.environ.get("REMINDER_MIN", "0"))
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+SUPABASE_URL   = os.environ["SUPABASE_URL"]
+SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
 
 KST = timezone(timedelta(hours=9))
+
+# 주간 리마인더 실행 시각 (매주 화요일) — 기본 19:00 KST
+WEEKLY_REMINDER_HOUR = int(os.environ.get("WEEKLY_REMINDER_HOUR", "19"))
+WEEKLY_REMINDER_MIN  = int(os.environ.get("WEEKLY_REMINDER_MIN",  "0"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,11 +51,13 @@ HEADERS = {
     "Prefer": "return=representation",
 }
 
-# ── 입력 단계 순서 ─────────────────────────────────────────────────────────────
+DEPTS = ["자문회", "장년회", "부녀회", "청년회"]
+
+# ── 심방 입력 8단계 ────────────────────────────────────────────────────────────
 STEPS = ["shepherd", "date", "plan", "target", "done", "worship", "note", "attendance"]
 STEP_LABELS = {
     "shepherd":   "👤 심방자 (예: 홍길동(집사))",
-    "date":       "📅 심방날짜 (예: 4/23 또는 2026-04-23)",
+    "date":       "📅 심방날짜 (예: 4/27 또는 2026-04-27)",
     "plan":       "📝 심방계획",
     "target":     "🎯 타겟여부",
     "done":       "✅ 진행여부",
@@ -76,47 +72,20 @@ STEP_CHOICES = {
     "attendance": [["참석", "불참"]],
 }
 
-# ── 관리단계 체크리스트 정의 ──────────────────────────────────────────────────
-STAGE_ITEMS = {
-    1: [
-        ("s1_chat_opened",    "구역장 창개설 및 초대완료"),
-        ("s1_1st_strategy",   "담당 강사 1차 전략 모임"),
-        ("s1_1st_visit",      "인섬교/친분자 1차 심방 (결석 사유파악)"),
-        ("s1_prayer",         "기도문 올리기"),
-    ],
-    2: [
-        ("s2_2nd_strategy",   "담당 강사 2차 전략 모임"),
-        ("s2_2nd_visit",      "2차 심방 (신앙우위자 선정)"),
-        ("s2_solution",       "결석 사유에 대한 해결 방안 제시"),
-        ("s2_prayer_rotation","인섬교 로테이션 기도문 올리기"),
-    ],
-    3: [
-        ("s3_3rd_strategy",   "담당 강사 3차 전략 모임"),
-        ("s3_video_letter",   "구역장의 회장/지파장 영상편지 심방"),
-        ("s3_sharing",        "인섬교 친교 후 창에 공유"),
-    ],
-    4: [
-        ("s4_4th_strategy",   "담당 강사 4차 전략 모임"),
-        ("s4_pastor_visit",   "강사/전도사 심방 진행"),
-    ],
-}
-STAGE_TITLES = {1: "1단계", 2: "2단계", 3: "3단계", 4: "4단계"}
+# ── 특별관리 4항목 ─────────────────────────────────────────────────────────────
+SP_ITEMS = [
+    ("item1_chat_invited",  "대책방 초대완료 (구역장, 인섬교, 강사, 전도사, 심방부사명자)", "one"),
+    ("item2_feedback_done", "금주 피드백 진행",                                             "weekly_check"),
+    ("item3_visit_date",    "금주 심방예정일",                                              "weekly_text"),
+    ("item4_visit_plan",    "금주 심방계획",                                                "weekly_text"),
+]
 
-# ── 마크다운 이스케이프 ──────────────────────────────────────────────────────
-# 이름·지역·구역 등 사용자 데이터에 *_[]() 가 들어가면 Markdown 파싱이 깨짐
+# ── 마크다운 이스케이프 ────────────────────────────────────────────────────────
 _MD_SPECIALS = "_*`["
 def md(s) -> str:
-    if s is None:
-        return ""
-    out = []
-    for ch in str(s):
-        if ch in _MD_SPECIALS:
-            out.append("\\" + ch)
-        else:
-            out.append(ch)
-    return "".join(out)
+    if s is None: return ""
+    return "".join(("\\" + c) if c in _MD_SPECIALS else c for c in str(s))
 
-# 텔레그램 메시지 최대 길이 (여유 포함)
 TG_MAX_LEN = 3800
 
 
@@ -127,9 +96,12 @@ async def sb_get(path: str):
     async with httpx.AsyncClient() as client:
         r = await client.get(f"{SUPABASE_URL}/rest/v1/{path}", headers=HEADERS, timeout=15)
         r.raise_for_status()
-        if not r.content or not r.content.strip():   # 빈 응답 방어
+        if not r.content or not r.content.strip():
             return []
-        return r.json()
+        try:
+            return r.json()
+        except Exception:
+            return []
 
 async def sb_rpc(func: str, payload: dict):
     async with httpx.AsyncClient() as client:
@@ -142,7 +114,6 @@ async def sb_rpc(func: str, payload: dict):
         if r.status_code >= 400:
             logger.error("RPC %s failed %s: %s", func, r.status_code, r.text[:500])
         r.raise_for_status()
-        # 일부 RPC는 void 반환 → 빈 body
         if not r.content:
             return None
         try:
@@ -150,6 +121,96 @@ async def sb_rpc(func: str, payload: dict):
         except Exception:
             return None
 
+async def sb_delete(path: str):
+    async with httpx.AsyncClient() as client:
+        r = await client.delete(f"{SUPABASE_URL}/rest/v1/{path}", headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 주차 계산 — 화요일 18시 KST 기준
+# ─────────────────────────────────────────────────────────────────────────────
+def get_target_sunday(now: datetime | None = None) -> datetime:
+    """화요일 18시 KST 이후면 다음 주일, 아니면 지난 주일 반환."""
+    if now is None:
+        now = datetime.now(KST)
+    else:
+        now = now.astimezone(KST)
+    
+    weekday = now.weekday()  # 0=월, 1=화, 2=수, ..., 6=일
+    hour = now.hour
+    
+    # 일요일(6)
+    if weekday == 6:
+        diff = 0
+    # 월요일(0) ~ 화요일(1) 18시 미만 → 지난 주일
+    elif weekday == 0 or (weekday == 1 and hour < 18):
+        diff = -(weekday + 1)
+    # 화요일(1) 18시 이상 ~ 토요일(5) → 다음 주일
+    else:
+        diff = 6 - weekday
+
+    target = (now + timedelta(days=diff)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return target
+
+
+def get_sunday_week_no(sunday: datetime) -> int:
+    """해당 월의 몇 번째 일요일인지 반환 (1~5)."""
+    year, month = sunday.year, sunday.month
+    count = 0
+    cursor = datetime(year, month, 1, tzinfo=KST)
+    last_day = (datetime(year, month + 1, 1, tzinfo=KST) - timedelta(days=1)).day if month < 12 \
+               else 31
+    for d in range(1, last_day + 1):
+        cursor = cursor.replace(day=d)
+        if cursor.weekday() == 6:  # 일요일
+            count += 1
+            if d == sunday.day:
+                return count
+    return 1
+
+
+def compute_target_week_key() -> tuple[str, str]:
+    """화요일 18시 기준 현재 타겟 주차의 (week_key, week_label) 반환."""
+    sunday = get_target_sunday()
+    year, month = sunday.year, sunday.month
+    week_no = get_sunday_week_no(sunday)
+    week_key = f"{year}-{month:02d}-w{week_no}"
+    week_label = f"{year}년 {month}월 {week_no}주차"
+    return week_key, week_label
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 최신 주차 — DB에서 가장 최근 등록된 주차를 가져오되,
+# 화요일 18시 기준 계산된 주차가 DB에 있으면 그것을 우선 사용
+# ─────────────────────────────────────────────────────────────────────────────
+async def get_active_week_key() -> tuple[str, str]:
+    """현재 사용할 week_key, week_label 반환."""
+    expected_key, expected_label = compute_target_week_key()
+    try:
+        rows = await sb_get(
+            f"weekly_target_weeks?select=week_key,week_label&week_key=eq.{quote(expected_key)}&limit=1"
+        )
+        if rows:
+            return rows[0]["week_key"], rows[0].get("week_label", expected_label)
+    except Exception as e:
+        logger.warning("get_active_week_key DB check failed: %s", e)
+
+    # 기대 주차가 DB에 없으면 가장 최신 주차로 fallback
+    try:
+        rows = await sb_get("weekly_target_weeks?select=week_key,week_label&order=week_key.desc&limit=1")
+        if rows:
+            return rows[0]["week_key"], rows[0].get("week_label", rows[0]["week_key"])
+    except Exception as e:
+        logger.warning("get_active_week_key fallback failed: %s", e)
+    
+    return "", ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 컨텍스트 저장
+# ─────────────────────────────────────────────────────────────────────────────
 async def get_ctx(chat_id: int):
     rows = await sb_rpc("get_telegram_visit_context", {"p_chat_id": chat_id})
     if rows:
@@ -165,47 +226,75 @@ async def save_ctx(chat_id: int, **kwargs):
 async def clear_tmp(chat_id: int):
     await sb_rpc("clear_telegram_tmp", {"p_chat_id": chat_id})
 
-async def get_latest_week_key() -> str:
-    try:
-        rows = await sb_get("weekly_target_weeks?select=week_key&order=week_key.desc&limit=1")
-        if rows and isinstance(rows, list):
-            return rows[0].get("week_key", "")
-    except Exception as e:
-        logger.warning("get_latest_week_key failed: %s", e)
-    return ""
 
-async def get_recent_weeks(limit: int = 6):
-    """최근 주차 목록 (week_key, week_label) 반환."""
+# ─────────────────────────────────────────────────────────────────────────────
+# 구역 정규화 — "2-1" ↔ "2팀1"
+# ─────────────────────────────────────────────────────────────────────────────
+def normalize_zone_py(z: str) -> str:
+    if not z: return ""
+    s = re.sub(r"\s+", "", z.strip())
+    m = re.match(r"^(\d+)[-_](\d+)$", s)
+    if m: return f"{m.group(1)}팀{m.group(2)}"
+    m = re.match(r"^(\d+)팀(\d+)$", s)
+    if m: return f"{m.group(1)}팀{m.group(2)}"
+    return s
+
+
+def looks_like_zone(text: str) -> bool:
+    """입력 문자열이 구역 형식인지 판별 (2-1, 2팀1, 1-3 등)"""
+    s = re.sub(r"\s+", "", text.strip())
+    return bool(re.match(r"^\d+[-_팀]\d+$", s))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 결석자 조회
+# ─────────────────────────────────────────────────────────────────────────────
+async def get_absentees_by_region(week_key: str, dept: str, region: str):
     try:
-        rows = await sb_get(
-            f"weekly_target_weeks?select=week_key,week_label&order=week_key.desc&limit={limit}"
-        )
-        return rows or []
+        return await sb_rpc("get_absentees_by_dept_region", {
+            "p_week_key": week_key, "p_dept": dept, "p_region": region
+        }) or []
     except Exception as e:
-        logger.warning("get_recent_weeks failed: %s", e)
+        logger.warning("get_absentees_by_dept_region RPC failed, falling back: %s", e)
+        # fallback: REST
+        return await sb_get(
+            f"weekly_visit_targets"
+            f"?select=row_id,name,phone_last4,region_name,zone_name,consecutive_absent_count"
+            f"&week_key=eq.{quote(week_key)}"
+            f"&dept=eq.{quote(dept)}"
+            f"&region_name=eq.{quote(region)}"
+            f"&order=zone_name.asc,name.asc"
+        )
+
+async def get_absentees_by_zone(week_key: str, dept: str, zone: str):
+    try:
+        return await sb_rpc("get_absentees_by_dept_zone", {
+            "p_week_key": week_key, "p_dept": dept, "p_zone": zone
+        }) or []
+    except Exception as e:
+        logger.warning("get_absentees_by_dept_zone RPC failed: %s", e)
         return []
 
-async def get_absentees(week_key: str, dept: str, region: str):
-    path = (
-        f"weekly_visit_targets"
-        f"?select=row_id,name,phone_last4,region_name,zone_name,consecutive_absent_count"
-        f"&week_key=eq.{quote(week_key, safe='')}"
-        f"&dept=eq.{quote(dept, safe='')}"
-        f"&region_name=eq.{quote(region, safe='')}"
-        f"&order=row_order.asc"
-    )
-    return await sb_get(path)
+async def get_absentees_4plus(week_key: str, dept: str):
+    try:
+        return await sb_rpc("get_absentees_4plus_by_dept", {
+            "p_week_key": week_key, "p_dept": dept
+        }) or []
+    except Exception as e:
+        logger.warning("get_absentees_4plus_by_dept failed: %s", e)
+        return []
+
 
 async def get_progress(week_key: str, row_id: str):
     rows = await sb_get(
-        f"weekly_visit_progress?select=*&week_key=eq.{week_key}&row_id=eq.{row_id}"
+        f"weekly_visit_progress?select=*&week_key=eq.{quote(week_key)}&row_id=eq.{quote(row_id)}"
     )
     return rows[0] if rows else None
+
 
 async def upsert_progress(week_key: str, row_id: str, ctx: dict):
     raw_date = ctx.get("tmp_date") or ""
     date_sort = raw_date if re.match(r"^\d{4}-\d{2}-\d{2}$", raw_date) else None
-
     await sb_rpc("upsert_weekly_visit_progress", {
         "p_week_key":           week_key,
         "p_row_id":             row_id,
@@ -220,102 +309,67 @@ async def upsert_progress(week_key: str, row_id: str, ctx: dict):
         "p_note":               ctx.get("tmp_note") or "",
     })
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 관리단계 헬퍼
-# ─────────────────────────────────────────────────────────────────────────────
-async def get_management_targets(week_key: str):
-    return await sb_rpc("get_management_targets", {"p_week_key": week_key}) or []
-
-async def toggle_management_item(week_key: str, row_id: str, field: str, value: bool):
-    await sb_rpc("toggle_management_item", {
-        "p_week_key": week_key,
-        "p_row_id":   row_id,
-        "p_field":    field,
-        "p_value":    value,
-    })
-
-async def set_management_stage(week_key: str, row_id: str, stage: int):
-    await sb_rpc("set_management_stage", {
-        "p_week_key": week_key,
-        "p_row_id":   row_id,
-        "p_stage":    stage,
-    })
-
-async def mark_management_reminder(week_key: str, row_id: str):
-    await sb_rpc("mark_management_reminder", {"p_week_key": week_key, "p_row_id": row_id})
-
-async def register_admin_chat(chat_id: int, chat_title: str, note: str = ""):
-    await sb_rpc("register_admin_chat", {
-        "p_chat_id":    chat_id,
-        "p_chat_title": chat_title or "",
-        "p_note":       note,
-    })
-
-async def get_admin_chats():
-    rows = await sb_get("telegram_admin_chats?select=chat_id,chat_title")
-    return rows or []
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# /부서 지역 명령어 → 주차 확인 메뉴 먼저 표시
+# 표시용 연속결석 수 = 저장된 값 (이미 업로드 시 +1 적용되어 있음)
+# 추가 보정 없이 그대로 표시.
+# (업로드 시 apply_consecutive_absent_increment 가 호출되어 +1 된 상태)
 # ─────────────────────────────────────────────────────────────────────────────
-async def dept_region_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cmd_text = update.message.text.strip()
-    parts = cmd_text.split(None, 1)
-    dept = parts[0].lstrip("/")
-    region = parts[1].strip() if len(parts) > 1 else ""
-
-    if not region:
-        await update.message.reply_text(f"❗ 지역을 함께 입력해주세요.\n예) /{dept} 강북")
-        return
-
+def display_streak(n) -> str:
+    """연속결석 횟수 표시용 - 이미 DB 저장 시 +1 되어 있으므로 그대로 표시"""
     try:
-        # 최신 주차 + 최근 주차 목록 동시 조회
-        latest_key = await get_latest_week_key()
-        if not latest_key:
-            await update.message.reply_text("❌ 등록된 주차 데이터가 없습니다.\n웹 대시보드에서 명단을 먼저 업로드해주세요.")
-            return
-
-        recent_weeks = await get_recent_weeks(6)
-
-        # dept / region 을 컨텍스트에 임시 저장 (week 미확정)
-        chat_id = update.effective_chat.id
-        await save_ctx(chat_id, dept_filter=dept, region_filter=region)
-
-        # 최신 주차 라벨 찾기
-        latest_label = next(
-            (w.get("week_label", latest_key) for w in recent_weeks if w.get("week_key") == latest_key),
-            latest_key,
-        )
-
-        # ── 버튼 구성 ──────────────────────────────────────────────────────
-        buttons = [
-            [InlineKeyboardButton(
-                f"✅ 이 주차로 진행  ({latest_label})",
-                callback_data=f"week_confirm:{latest_key}",
-            )]
-        ]
-        # 이전 주차가 있으면 '다른 주차 선택' 버튼 추가
-        if len(recent_weeks) > 1:
-            buttons.append([
-                InlineKeyboardButton("🔄 다른 주차 선택", callback_data="week_select")
-            ])
-
-        await update.message.reply_text(
-            f"📋 *{md(dept)} / {md(region)}*\n\n"
-            f"📅 현재 최신 주차: *{md(latest_label)}*\n"
-            f"어느 주차 결석자를 조회할까요?",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-
-    except Exception as e:
-        logger.exception(e)
-        await update.message.reply_text(f"❌ 오류: {e}")
+        return str(int(n))
+    except Exception:
+        return str(n or 0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 콜백 (버튼 클릭) — select / choice / mgmt_*
+# 메인 메뉴 (인라인 버튼)
+# ─────────────────────────────────────────────────────────────────────────────
+def build_main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋 결석자",           callback_data="menu:absentee"),
+            InlineKeyboardButton("🚨 특별관리결석자",    callback_data="menu:special"),
+        ],
+        [
+            InlineKeyboardButton("❓ 도움말",            callback_data="menu:help"),
+        ],
+    ])
+
+
+def build_dept_menu_kb(kind: str) -> InlineKeyboardMarkup:
+    """kind: 'absentee' | 'special'"""
+    rows = []
+    pair = []
+    for dept in DEPTS:
+        pair.append(InlineKeyboardButton(dept, callback_data=f"{kind}_dept:{dept}"))
+        if len(pair) == 2:
+            rows.append(pair); pair = []
+    if pair: rows.append(pair)
+    rows.append([InlineKeyboardButton("◀ 메인 메뉴", callback_data="menu:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /start /menu — 메인 메뉴 표시
+# ─────────────────────────────────────────────────────────────────────────────
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    week_key, week_label = await get_active_week_key()
+    header = (
+        "👋 *결석자 타겟 심방 봇*에 오신 것을 환영합니다\n\n"
+        f"📅 현재 주차: *{md(week_label) if week_label else '미등록'}*\n"
+        "아래 메뉴에서 원하는 기능을 선택하세요 👇"
+    )
+    await update.message.reply_text(header, parse_mode="Markdown", reply_markup=build_main_menu_kb())
+
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_command(update, context)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 메인 콜백 디스패처
 # ─────────────────────────────────────────────────────────────────────────────
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -324,7 +378,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     try:
-        if data.startswith("select:"):
+        # ── 메인 메뉴 ──
+        if data == "menu:home":
+            await _show_main_menu(update)
+        elif data == "menu:absentee":
+            await _show_dept_select(update, "absentee")
+        elif data == "menu:special":
+            await _show_dept_select(update, "special")
+        elif data == "menu:help":
+            await _show_help(update, edit=True)
+
+        # ── 일반 결석자 흐름 ──
+        elif data.startswith("absentee_dept:"):
+            dept = data.split(":", 1)[1]
+            await _on_absentee_dept_selected(update, chat_id, dept)
+        elif data.startswith("select:"):
             await _on_select_absentee(update, chat_id, data.split(":", 1)[1])
         elif data.startswith("choice:"):
             _, step, value = data.split(":", 2)
@@ -333,28 +401,32 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _do_save(update, chat_id)
         elif data == "cancel_save":
             await clear_tmp(chat_id)
-            await query.message.reply_text("🚫 저장이 취소됐습니다.")
-        # ── 주차 확인 ──
-        elif data.startswith("week_confirm:"):
-            week_key = data.split(":", 1)[1]
-            await _on_week_confirmed(update, chat_id, week_key)
-        elif data == "week_select":
-            await _on_week_select(update, chat_id)
-        elif data.startswith("week_pick:"):
-            week_key = data.split(":", 1)[1]
-            await _on_week_confirmed(update, chat_id, week_key)
-        # ── 관리단계 ──
-        elif data == "mgmt_back":
-            await _show_management_list(update, chat_id, edit=True)
-        elif data.startswith("mgmt_view:"):
-            row_id = data.split(":", 1)[1]
-            await _show_management_detail(update, chat_id, row_id, edit=True)
-        elif data.startswith("mgmt_toggle:"):
-            _, row_id, field = data.split(":", 2)
-            await _on_mgmt_toggle(update, chat_id, row_id, field)
-        elif data.startswith("mgmt_stage:"):
-            _, row_id, stage_s = data.split(":", 2)
-            await _on_mgmt_stage(update, chat_id, row_id, int(stage_s))
+            await query.message.reply_text("🚫 저장이 취소됐습니다.\n/menu 로 메인 메뉴로 돌아가세요.")
+
+        # ── 특별관리 흐름 ──
+        elif data.startswith("special_dept:"):
+            dept = data.split(":", 1)[1]
+            await _on_special_dept_selected(update, chat_id, dept)
+        elif data.startswith("sp_pick:"):
+            # sp_pick:{dept}:{name}:{phone_last4}
+            _, dept, name, phone = data.split(":", 3)
+            await _on_special_person_selected(update, chat_id, dept, name, phone)
+        elif data.startswith("sp_toggle1:"):
+            _, dept, name, phone = data.split(":", 3)
+            await _on_sp_toggle1(update, chat_id, dept, name, phone)
+        elif data.startswith("sp_toggle2:"):
+            _, dept, name, phone = data.split(":", 3)
+            await _on_sp_toggle2(update, chat_id, dept, name, phone)
+        elif data.startswith("sp_edit3:"):
+            _, dept, name, phone = data.split(":", 3)
+            await _on_sp_edit_text(update, chat_id, dept, name, phone, "3")
+        elif data.startswith("sp_edit4:"):
+            _, dept, name, phone = data.split(":", 3)
+            await _on_sp_edit_text(update, chat_id, dept, name, phone, "4")
+        elif data.startswith("sp_unregister:"):
+            _, dept, name, phone = data.split(":", 3)
+            await _on_sp_unregister(update, chat_id, dept, name, phone)
+
     except Exception as e:
         logger.exception(e)
         try:
@@ -363,94 +435,189 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-async def _on_week_confirmed(update: Update, chat_id: int, week_key: str):
-    """주차 확정 → 결석자 목록 표시."""
-    query = update.callback_query
-    ctx = await get_ctx(chat_id)
-    if not ctx:
-        await query.message.reply_text("❌ 세션이 만료됐습니다. 다시 명령어를 입력해주세요.")
+async def _show_main_menu(update: Update):
+    week_key, week_label = await get_active_week_key()
+    text = (
+        "🏠 *메인 메뉴*\n\n"
+        f"📅 현재 주차: *{md(week_label) if week_label else '미등록'}*\n"
+        "원하는 기능을 선택하세요 👇"
+    )
+    q = update.callback_query
+    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=build_main_menu_kb())
+
+
+async def _show_dept_select(update: Update, kind: str):
+    q = update.callback_query
+    header = {
+        "absentee": "📋 *결석자 조회*\n\n부서를 선택하세요 👇",
+        "special":  "🚨 *특별관리결석자*\n\n부서를 선택하세요 👇\n(연속결석 4회 이상만 표시됩니다)",
+    }[kind]
+    await q.edit_message_text(header, parse_mode="Markdown", reply_markup=build_dept_menu_kb(kind))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 일반 결석자 흐름
+# ─────────────────────────────────────────────────────────────────────────────
+async def _on_absentee_dept_selected(update: Update, chat_id: int, dept: str):
+    q = update.callback_query
+    week_key, week_label = await get_active_week_key()
+    if not week_key:
+        await q.edit_message_text("❌ 등록된 주차가 없습니다. 웹 대시보드에서 명단을 먼저 업로드해주세요.")
         return
 
-    dept   = ctx.get("dept_filter", "")
-    region = ctx.get("region_filter", "")
+    # 컨텍스트에 저장 — 다음 입력은 "지역 또는 구역명"
+    await save_ctx(chat_id,
+        active_week_key=week_key,
+        dept_filter=dept,
+        region_filter="",
+        editing_step="awaiting_region_or_zone",
+    )
 
-    # week_key 를 컨텍스트에 저장
-    await save_ctx(chat_id, active_week_key=week_key)
+    text = (
+        f"✅ *{md(dept)}* 선택\n"
+        f"📅 주차: `{md(week_label)}`\n\n"
+        f"🔍 *지역 또는 구역명을 입력*해주세요.\n\n"
+        f"• 지역 예) `강북`, `강남`, `강서`, `강동`\n"
+        f"• 구역 예) `2-1` 또는 `2팀1` (둘 다 동일)\n\n"
+        f"취소하려면 /취소 를 입력하세요."
+    )
+    await q.edit_message_text(text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("◀ 부서 다시 선택", callback_data="menu:absentee")]
+        ]),
+    )
 
-    # 주차 라벨 조회
-    try:
-        wrows = await sb_get(
-            f"weekly_target_weeks?select=week_label&week_key=eq.{quote(week_key, safe='')}&limit=1"
-        )
-        week_label = wrows[0].get("week_label", week_key) if wrows else week_key
-    except Exception:
-        week_label = week_key
 
-    await query.edit_message_text(f"🔍 *{md(dept)} / {md(region)}* 결석자 불러오는 중…", parse_mode="Markdown")
-
-    absentees = await get_absentees(week_key, dept, region)
+async def _render_absentee_list(update, chat_id: int, dept: str, query: str, 
+                                absentees: list, week_label: str, by_zone: bool):
+    """조회 결과를 버튼 목록으로 표시"""
     if not absentees:
-        await query.edit_message_text(
-            f"📭 [{dept} / {region}] 결석자가 없습니다.\n(주차: {week_label})"
-        )
-        return
+        msg = (f"📭 [{dept} / {query}] 결석자가 없습니다.\n"
+               f"(주차: {week_label})\n\n"
+               f"/menu 로 메인 메뉴로 돌아가세요.")
+        return await update.message.reply_text(msg)
 
     buttons = []
     row = []
     for ab in absentees:
         name   = ab.get("name", "?")
-        phone  = ab.get("phone_last4", "")
-        streak = ab.get("consecutive_absent_count", "")
-        label  = f"{name}({phone}) 연속{streak}회"
+        phone  = ab.get("phone_last4", "") or ""
+        zone   = ab.get("zone_name", "") or ""
+        region = ab.get("region_name", "") or ""
+        streak = display_streak(ab.get("consecutive_absent_count"))
+        special_mark = "🚨 " if ab.get("is_special_managed") else ""
+
+        # 지역 조회면: "이름 구역 연속X회"
+        # 구역 조회면: "이름 연속X회"
+        if by_zone:
+            label = f"{special_mark}{name} 연속{streak}회"
+        else:
+            label = f"{special_mark}{name} {zone} 연속{streak}회"
+        
         row.append(InlineKeyboardButton(label, callback_data=f"select:{ab['row_id']}"))
-        if len(row) == 2:
+        if len(row) == 1:  # 한 줄에 1개씩 (이름 + 구역 + 연속횟수 길이 때문)
             buttons.append(row); row = []
-    if row:
-        buttons.append(row)
+    if row: buttons.append(row)
+    buttons.append([InlineKeyboardButton("◀ 메인 메뉴", callback_data="menu:home")])
 
-    await query.edit_message_text(
-        f"📋 *{md(dept)} / {md(region)}* 결석자 목록\n"
-        f"주차: `{week_label}` | 총 {len(absentees)}명\n\n"
-        f"심방 기록할 결석자를 선택하세요 👇",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+    header = (
+        f"📋 *{md(dept)} / {md(query)}* 결석자 목록\n"
+        f"주차: `{md(week_label)}` | 총 {len(absentees)}명\n\n"
+        f"심방 기록할 결석자를 선택하세요 👇"
     )
+    await update.message.reply_text(header, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons))
 
 
-async def _on_week_select(update: Update, chat_id: int):
-    """주차 목록 버튼 메뉴 표시."""
-    query = update.callback_query
-    recent_weeks = await get_recent_weeks(6)
-    if not recent_weeks:
-        await query.answer("조회 가능한 주차가 없습니다.", show_alert=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# 텍스트 메시지 처리 (지역/구역 입력 또는 단계 입력)
+# ─────────────────────────────────────────────────────────────────────────────
+async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+
+    ctx = await get_ctx(chat_id)
+    if not ctx:
+        return  # 무시
+
+    step = ctx.get("editing_step", "")
+
+    # ── 1) 지역/구역 입력 대기 ──
+    if step == "awaiting_region_or_zone":
+        dept = ctx.get("dept_filter", "")
+        week_key = ctx.get("active_week_key", "")
+        if not dept or not week_key:
+            await update.message.reply_text("❌ 세션이 만료됐습니다. /menu 로 다시 시작해주세요.")
+            return
+
+        # 주차 라벨 조회
+        wrows = await sb_get(
+            f"weekly_target_weeks?select=week_label&week_key=eq.{quote(week_key)}&limit=1"
+        )
+        week_label = wrows[0]["week_label"] if wrows else week_key
+
+        # 구역 형식이면 구역 검색, 아니면 지역 검색
+        if looks_like_zone(text):
+            normalized = normalize_zone_py(text)
+            absentees = await get_absentees_by_zone(week_key, dept, normalized)
+            await save_ctx(chat_id, region_filter=normalized, editing_step="")
+            await _render_absentee_list(update, chat_id, dept, normalized,
+                                        absentees, week_label, by_zone=True)
+        else:
+            absentees = await get_absentees_by_region(week_key, dept, text)
+            await save_ctx(chat_id, region_filter=text, editing_step="")
+            await _render_absentee_list(update, chat_id, dept, text,
+                                        absentees, week_label, by_zone=False)
         return
 
-    buttons = [
-        [InlineKeyboardButton(
-            f"📅 {w.get('week_label', w.get('week_key', '?'))}",
-            callback_data=f"week_pick:{w.get('week_key', '')}",
-        )]
-        for w in recent_weeks
-    ]
+    # ── 2) 특별관리 3/4번 텍스트 입력 대기 ──
+    if step in ("awaiting_sp_item3", "awaiting_sp_item4"):
+        dept  = ctx.get("dept_filter", "")
+        name  = ctx.get("tmp_sp_name", "")
+        phone = ctx.get("tmp_sp_phone", "")
+        if step == "awaiting_sp_item3":
+            await sb_rpc("set_special_item3", {
+                "p_dept": dept, "p_name": name, "p_phone_last4": phone, "p_value": text
+            })
+            field_label = "금주 심방예정일"
+        else:
+            await sb_rpc("set_special_item4", {
+                "p_dept": dept, "p_name": name, "p_phone_last4": phone, "p_value": text
+            })
+            field_label = "금주 심방계획"
+        
+        await save_ctx(chat_id, editing_step="")
+        await update.message.reply_text(
+            f"✅ *{md(field_label)}* 저장됨:\n`{md(text)}`",
+            parse_mode="Markdown"
+        )
+        # 다시 상세 화면 표시
+        await _show_special_detail_for_person(update, dept, name, phone, send_new=True)
+        return
 
-    await query.edit_message_text(
-        "🗓 조회할 주차를 선택하세요:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    # ── 3) 일반 심방 입력 단계 ──
+    if step in STEPS:
+        tmp_key = f"tmp_{step}"
+        await save_ctx(chat_id, **{tmp_key: text})
+        step_idx = STEPS.index(step)
+        await _proceed_to_next_step(update, chat_id, step_idx, ctx)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 심방 기록 입력 흐름 (기존)
+# ─────────────────────────────────────────────────────────────────────────────
 async def _on_select_absentee(update: Update, chat_id: int, row_id: str):
     query = update.callback_query
     ctx = await get_ctx(chat_id)
     if not ctx:
-        await query.message.reply_text("❌ 세션이 만료됐습니다. 다시 명령어를 입력해주세요.")
+        await query.message.reply_text("❌ 세션 만료. /menu 로 다시 시작해주세요.")
         return
 
     week_key = ctx.get("active_week_key", "")
     prog = await get_progress(week_key, row_id)
-
     rows = await sb_get(
-        f"weekly_visit_targets?select=name,phone_last4,region_name,zone_name&row_id=eq.{row_id}&week_key=eq.{week_key}"
+        f"weekly_visit_targets?select=name,phone_last4,region_name,zone_name"
+        f"&row_id=eq.{quote(row_id)}&week_key=eq.{quote(week_key)}"
     )
     ab = rows[0] if rows else {}
     name = ab.get("name", "?")
@@ -468,34 +635,16 @@ async def _on_select_absentee(update: Update, chat_id: int, row_id: str):
 
     await query.message.reply_text(
         f"✏️ *{md(name)}* 님 심방 기록 시작{existing_info}\n\n"
-        f"1️⃣ {STEP_LABELS['shepherd']}\n입력해주세요:",
+        f"1️⃣ {STEP_LABELS['shepherd']}\n입력해주세요:\n\n"
+        f"중단하려면 /취소 를 입력하세요.",
         parse_mode="Markdown",
     )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 단계별 입력 흐름 (기존 로직 유지)
-# ─────────────────────────────────────────────────────────────────────────────
-async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    text = update.message.text.strip()
-
-    ctx = await get_ctx(chat_id)
-    if not ctx or not ctx.get("editing_step"):
-        return
-
-    step = ctx["editing_step"]
-    tmp_key = f"tmp_{step}"
-    await save_ctx(chat_id, **{tmp_key: text})
-    step_idx = STEPS.index(step)
-    await _proceed_to_next_step(update, chat_id, step_idx, ctx)
 
 
 async def _handle_choice(update: Update, chat_id: int, step: str, value: str):
     query = update.callback_query
     tmp_key = f"tmp_{step}"
     await save_ctx(chat_id, **{tmp_key: value})
-
     ctx = await get_ctx(chat_id)
     step_idx = STEPS.index(step)
 
@@ -535,7 +684,7 @@ async def _show_confirm(update, chat_id: int, ctx: dict = None):
     if ctx is None:
         ctx = await get_ctx(chat_id)
     row_id = ctx.get("editing_row_id", "")
-    rows = await sb_get(f"weekly_visit_targets?select=name&row_id=eq.{row_id}")
+    rows = await sb_get(f"weekly_visit_targets?select=name&row_id=eq.{quote(row_id)}")
     name = rows[0]["name"] if rows else row_id
 
     summary = (
@@ -551,8 +700,8 @@ async def _show_confirm(update, chat_id: int, ctx: dict = None):
         f"저장하시겠습니까?"
     )
     buttons = [[
-        InlineKeyboardButton("✅ 보내기 (저장)", callback_data="confirm_save"),
-        InlineKeyboardButton("❌ 취소",          callback_data="cancel_save"),
+        InlineKeyboardButton("✅ 저장", callback_data="confirm_save"),
+        InlineKeyboardButton("❌ 취소", callback_data="cancel_save"),
     ]]
     await update.message.reply_text(summary, parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons))
@@ -562,23 +711,21 @@ async def _do_save(update: Update, chat_id: int):
     query = update.callback_query
     ctx = await get_ctx(chat_id)
     if not ctx:
-        await query.message.reply_text("❌ 세션 만료. 다시 시작해주세요.")
+        await query.message.reply_text("❌ 세션 만료.")
         return
     week_key = ctx.get("active_week_key", "")
     row_id   = ctx.get("editing_row_id", "")
     if not week_key or not row_id:
         await query.message.reply_text("❌ 저장 정보가 없습니다.")
         return
-
     try:
         await upsert_progress(week_key, row_id, ctx)
         await clear_tmp(chat_id)
-        rows = await sb_get(f"weekly_visit_targets?select=name&row_id=eq.{row_id}")
+        rows = await sb_get(f"weekly_visit_targets?select=name&row_id=eq.{quote(row_id)}")
         name = rows[0]["name"] if rows else row_id
         await query.message.reply_text(
-            f"✅ *{md(name)}* 님의 심방 기록이 저장됐습니다!\n\n"
-            f"계속하려면 명령어를 다시 입력하세요.\n"
-            f"예) /{ctx.get('dept_filter','')} {ctx.get('region_filter','')}",
+            f"✅ *{md(name)}* 님 심방 기록 저장 완료!\n\n"
+            f"계속하려면 /menu 로 돌아가세요.",
             parse_mode="Markdown",
         )
     except Exception as e:
@@ -587,310 +734,303 @@ async def _do_save(update: Update, chat_id: int):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 관리단계 — 명령어와 뷰
+# 특별관리결석자 흐름
 # ─────────────────────────────────────────────────────────────────────────────
-async def register_admin_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    title = chat.title or chat.full_name or f"chat_{chat.id}"
-    try:
-        await register_admin_chat(chat.id, title, note="registered via /관리대책방등록")
-        await update.message.reply_text(
-            f"✅ 이 채팅방(`{md(title)}`)을 관리대책방으로 등록했습니다.\n"
-            f"매일 {REMINDER_HOUR:02d}:{REMINDER_MIN:02d}(KST)에 미체크 항목 리마인더를 보냅니다.\n\n"
-            f"해제: /관리대책방해제",
-            parse_mode="Markdown",
-        )
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            await update.message.reply_text(
-                "❌ `register_admin_chat` RPC가 DB에 아직 없습니다.\n"
-                "Supabase SQL Editor에서 `supabase_additions.sql` 을 먼저 실행해주세요.",
-                parse_mode="Markdown",
-            )
-        else:
-            logger.exception(e)
-            await update.message.reply_text(f"❌ 등록 실패: HTTP {e.response.status_code}")
-    except Exception as e:
-        logger.exception(e)
-        await update.message.reply_text(f"❌ 등록 실패: {e}")
-
-
-async def unregister_admin_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """현재 채팅방을 관리대책방 목록에서 제거"""
-    chat_id = update.effective_chat.id
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.delete(
-                f"{SUPABASE_URL}/rest/v1/telegram_admin_chats?chat_id=eq.{chat_id}",
-                headers=HEADERS,
-                timeout=15,
-            )
-            r.raise_for_status()
-        await update.message.reply_text("🗑️ 이 채팅방을 관리대책방에서 해제했습니다.")
-    except Exception as e:
-        logger.exception(e)
-        await update.message.reply_text(f"❌ 해제 실패: {e}")
-
-
-async def management_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await _show_management_list(update, update.effective_chat.id, edit=False)
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            await update.message.reply_text(
-                "❌ `get_management_targets` RPC가 DB에 아직 없습니다.\n"
-                "Supabase SQL Editor에서 `supabase_additions.sql` 을 먼저 실행해주세요.",
-                parse_mode="Markdown",
-            )
-        else:
-            raise
-
-
-async def _show_management_list(update: Update, chat_id: int, edit: bool = False):
-    week_key = await get_latest_week_key()
+async def _on_special_dept_selected(update: Update, chat_id: int, dept: str):
+    q = update.callback_query
+    week_key, week_label = await get_active_week_key()
     if not week_key:
-        await _send_or_edit(update, edit, "❌ 등록된 주차가 없습니다.")
+        await q.edit_message_text("❌ 등록된 주차가 없습니다.")
         return
 
-    targets = await get_management_targets(week_key)
+    targets = await get_absentees_4plus(week_key, dept)
     if not targets:
-        await _send_or_edit(update, edit,
-            f"📭 연속결석 4회 이상 결석자가 없습니다.\n(주차: {week_key})")
+        await q.edit_message_text(
+            f"📭 *{md(dept)}* 의 연속결석 4회 이상 결석자가 없습니다.\n"
+            f"(주차: `{md(week_label)}`)",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀ 부서 다시 선택", callback_data="menu:special")]
+            ]),
+        )
         return
 
     buttons = []
     for t in targets:
         name   = t.get("name", "?")
-        dept   = t.get("dept", "")
-        region = t.get("region_name", "")
-        streak = t.get("consecutive_absent_count", "")
-        stage  = int(t.get("current_stage") or 1)
-        if stage not in STAGE_ITEMS:
-            stage = 1
-        # 해당 단계 미체크 개수
-        remaining = _count_remaining(t, stage)
-        mark = "🟢" if remaining == 0 else "🟡"
-        # 버튼 라벨은 Markdown 파싱 대상이 아니므로 이스케이프 불필요
-        label = f"{mark} {stage}단계 · {dept} {region} · {name}({streak}회) · 미{remaining}"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"mgmt_view:{t['row_id']}")])
+        phone  = t.get("phone_last4", "") or ""
+        region = t.get("region_name", "") or ""
+        zone   = t.get("zone_name", "") or ""
+        streak = display_streak(t.get("consecutive_absent_count"))
+        mark = "🚨" if t.get("is_special_managed") else "⚠️"
+        label = f"{mark} {name} ({region} {zone}) 연속{streak}회"
+        buttons.append([InlineKeyboardButton(label,
+            callback_data=f"sp_pick:{dept}:{name}:{phone}")])
 
+    buttons.append([InlineKeyboardButton("◀ 부서 다시 선택", callback_data="menu:special")])
+    
     text = (
-        f"📌 *연속결석 4회 이상 관리대상*\n"
-        f"주차: `{week_key}` | 총 {len(targets)}명\n\n"
-        f"🟢 해당 단계 전부 완료  🟡 미체크 있음\n\n"
-        f"관리할 대상을 선택하세요 👇"
+        f"🚨 *{md(dept)} 특별관리 대상자*\n"
+        f"주차: `{md(week_label)}` | 4회 이상 {len(targets)}명\n\n"
+        f"🚨 = 이미 특별관리 등록됨 (방 감지중)\n"
+        f"⚠️ = 아직 미등록\n\n"
+        f"관리할 결석자를 선택하세요 👇\n"
+        f"(선택 시 *현재 이 방*이 감지 방으로 등록됩니다)"
     )
-    await _send_or_edit(update, edit, text,
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode="Markdown")
+    await q.edit_message_text(text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons))
 
 
-async def _show_management_detail(update: Update, chat_id: int, row_id: str, edit: bool = False):
-    week_key = await get_latest_week_key()
-    targets = await get_management_targets(week_key)
-    t = next((x for x in targets if x.get("row_id") == row_id), None)
-    if not t:
-        await _send_or_edit(update, edit, "❌ 해당 대상을 찾을 수 없습니다.")
+async def _on_special_person_selected(update: Update, chat_id: int,
+                                       dept: str, name: str, phone: str):
+    """특별관리 대상 선택 → 방 감지 등록 + 상세 화면 표시"""
+    q = update.callback_query
+    chat = update.effective_chat
+
+    # 먼저 결석자 정보 조회 (region, zone)
+    rows = await sb_get(
+        f"weekly_visit_targets?select=region_name,zone_name"
+        f"&dept=eq.{quote(dept)}&name=eq.{quote(name)}"
+        f"&phone_last4=eq.{quote(phone)}"
+        f"&limit=1"
+    )
+    region = rows[0].get("region_name", "") if rows else ""
+    zone   = rows[0].get("zone_name", "")   if rows else ""
+
+    # 방 감지 등록
+    try:
+        await sb_rpc("register_special_management", {
+            "p_dept":         dept,
+            "p_name":         name,
+            "p_phone_last4":  phone,
+            "p_region_name":  region,
+            "p_zone_name":    zone,
+            "p_chat_id":      chat.id,
+            "p_chat_title":   chat.title or chat.full_name or f"chat_{chat.id}",
+        })
+    except Exception as e:
+        logger.exception("register_special_management failed: %s", e)
+        await q.message.reply_text(f"❌ 등록 실패: {e}")
         return
 
-    stage = int(t.get("current_stage") or 1)
-    if stage not in STAGE_ITEMS:
-        stage = 1
-    name   = t.get("name", "?")
-    dept   = t.get("dept", "")
-    region = t.get("region_name", "")
-    zone   = t.get("zone_name", "")
-    streak = t.get("consecutive_absent_count", "")
-
-    header = (
-        f"👤 *{md(name)}* ({md(dept)} / {md(region)} {md(zone)})\n"
-        f"연속결석 {streak}회 · 현재 *{STAGE_TITLES[stage]}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
-    )
-
-    # 단계 전환 버튼
-    stage_buttons = []
-    row = []
-    for s in [1, 2, 3, 4]:
-        prefix = "✅" if s == stage else "  "
-        row.append(InlineKeyboardButton(f"{prefix} {s}단계",
-            callback_data=f"mgmt_stage:{row_id}:{s}"))
-    stage_buttons.append(row)
-
-    # 체크리스트 — 현재 단계의 항목만
-    items = STAGE_ITEMS[stage]
-    item_buttons = []
-    for field, label in items:
-        checked = bool(t.get(field))
-        mark = "✅" if checked else "⬜️"
-        item_buttons.append([
-            InlineKeyboardButton(f"{mark} {label}",
-                callback_data=f"mgmt_toggle:{row_id}:{field}")
-        ])
-
-    nav = [[InlineKeyboardButton("◀ 목록으로", callback_data="mgmt_back")]]
-
-    body_lines = [header, f"\n📝 *{STAGE_TITLES[stage]} 체크리스트*"]
-    remaining = _count_remaining(t, stage)
-    if remaining == 0:
-        body_lines.append("🎉 이 단계는 전부 완료됐습니다. 다음 단계로 이동을 고려하세요.")
-    else:
-        body_lines.append(f"미체크 {remaining}개 남음")
-
-    await _send_or_edit(update, edit,
-        "\n".join(body_lines),
+    await q.edit_message_text(
+        f"✅ *{md(name)}* 님을 *특별관리 대상*으로 등록했습니다.\n"
+        f"이 방에서 감지를 시작합니다.\n\n"
+        f"매주 화요일 {WEEKLY_REMINDER_HOUR:02d}:{WEEKLY_REMINDER_MIN:02d}(KST) 에 "
+        f"미체크 항목 리마인더가 이 방으로 발송됩니다.",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(stage_buttons + item_buttons + nav),
+    )
+    # 상세 화면 이어서 표시
+    await _show_special_detail_for_person(update, dept, name, phone, send_new=True)
+
+
+async def _show_special_detail_for_person(update, dept: str, name: str, phone: str,
+                                            send_new: bool = False):
+    """특별관리 한 명의 상세 체크리스트 표시"""
+    detail_rows = await sb_rpc("get_special_detail", {
+        "p_dept": dept, "p_name": name, "p_phone_last4": phone
+    })
+    if not detail_rows:
+        msg = "❌ 특별관리 정보를 찾을 수 없습니다."
+        target = update.message or (update.callback_query.message if update.callback_query else None)
+        if target:
+            await target.reply_text(msg)
+        return
+
+    d = detail_rows[0] if isinstance(detail_rows, list) else detail_rows
+    region = d.get("region_name", "") or ""
+    zone   = d.get("zone_name", "")   or ""
+
+    item1 = bool(d.get("item1_chat_invited"))
+    item2 = bool(d.get("item2_feedback_done"))
+    item3 = d.get("item3_visit_date") or ""
+    item4 = d.get("item4_visit_plan") or ""
+
+    text = (
+        f"🚨 *특별관리: {md(name)}*\n"
+        f"{md(dept)} / {md(region)} {md(zone)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{'✅' if item1 else '⬜️'} *1. 대책방 초대완료*\n"
+        f"   (구역장, 인섬교, 강사, 전도사, 심방부사명자)\n"
+        f"   _최초 한 번만 체크_\n\n"
+        f"{'✅' if item2 else '⬜️'} *2. 금주 피드백 진행*\n"
+        f"   _매주 화요일 {WEEKLY_REMINDER_HOUR}시 초기화_\n\n"
+        f"📅 *3. 금주 심방예정일:* {md(item3) if item3 else '_미입력_'}\n\n"
+        f"📝 *4. 금주 심방계획:* {md(item4) if item4 else '_미입력_'}"
+    )
+
+    buttons = [
+        [InlineKeyboardButton(
+            f"{'✅ 1번 체크됨 (탭하여 해제)' if item1 else '⬜️ 1번 체크하기 (대책방 초대완료)'}",
+            callback_data=f"sp_toggle1:{dept}:{name}:{phone}")],
+        [InlineKeyboardButton(
+            f"{'✅ 2번 체크됨 (탭하여 해제)' if item2 else '⬜️ 2번 체크하기 (금주 피드백 진행)'}",
+            callback_data=f"sp_toggle2:{dept}:{name}:{phone}")],
+        [InlineKeyboardButton("📅 3번 심방예정일 입력/수정",
+            callback_data=f"sp_edit3:{dept}:{name}:{phone}")],
+        [InlineKeyboardButton("📝 4번 심방계획 입력/수정",
+            callback_data=f"sp_edit4:{dept}:{name}:{phone}")],
+        [InlineKeyboardButton("🗑 특별관리 해제",
+            callback_data=f"sp_unregister:{dept}:{name}:{phone}")],
+        [InlineKeyboardButton("◀ 메인 메뉴", callback_data="menu:home")],
+    ]
+
+    kb = InlineKeyboardMarkup(buttons)
+    if send_new:
+        target = update.message or (update.callback_query.message if update.callback_query else None)
+        if target:
+            await target.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+    else:
+        q = update.callback_query
+        if q:
+            try:
+                await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+            except Exception:
+                await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def _on_sp_toggle1(update: Update, chat_id: int, dept: str, name: str, phone: str):
+    detail_rows = await sb_rpc("get_special_detail", {
+        "p_dept": dept, "p_name": name, "p_phone_last4": phone
+    })
+    cur = False
+    if detail_rows:
+        d = detail_rows[0] if isinstance(detail_rows, list) else detail_rows
+        cur = bool(d.get("item1_chat_invited"))
+    await sb_rpc("toggle_special_item1", {
+        "p_dept": dept, "p_name": name, "p_phone_last4": phone, "p_value": not cur
+    })
+    await _show_special_detail_for_person(update, dept, name, phone, send_new=False)
+
+
+async def _on_sp_toggle2(update: Update, chat_id: int, dept: str, name: str, phone: str):
+    detail_rows = await sb_rpc("get_special_detail", {
+        "p_dept": dept, "p_name": name, "p_phone_last4": phone
+    })
+    cur = False
+    if detail_rows:
+        d = detail_rows[0] if isinstance(detail_rows, list) else detail_rows
+        cur = bool(d.get("item2_feedback_done"))
+    await sb_rpc("toggle_special_item2", {
+        "p_dept": dept, "p_name": name, "p_phone_last4": phone, "p_value": not cur
+    })
+    await _show_special_detail_for_person(update, dept, name, phone, send_new=False)
+
+
+async def _on_sp_edit_text(update: Update, chat_id: int, dept: str, name: str, phone: str, which: str):
+    """which: '3' or '4'"""
+    q = update.callback_query
+    step = "awaiting_sp_item3" if which == "3" else "awaiting_sp_item4"
+    await save_ctx(chat_id,
+        dept_filter=dept,
+        tmp_sp_name=name,
+        tmp_sp_phone=phone,
+        editing_step=step,
+    )
+    label = "금주 심방예정일" if which == "3" else "금주 심방계획"
+    await q.message.reply_text(
+        f"✏️ *{md(name)}* 님의 *{label}* 을 입력해주세요:\n\n"
+        f"(예: 4월 27일 / 주일예배 후 가정심방 예정)\n\n"
+        f"취소하려면 /취소 입력",
+        parse_mode="Markdown",
     )
 
 
-async def _on_mgmt_toggle(update: Update, chat_id: int, row_id: str, field: str):
-    week_key = await get_latest_week_key()
-    # 현재 값 조회 후 반전 (목록 전체 대신 해당 한 명만 필요하지만
-    # 관리대상 수가 많지 않으니 현 구조 유지)
-    targets = await get_management_targets(week_key)
-    t = next((x for x in targets if x.get("row_id") == row_id), None)
-    current = bool(t.get(field)) if t else False
-    await toggle_management_item(week_key, row_id, field, not current)
-    await _show_management_detail(update, chat_id, row_id, edit=True)
-
-
-async def _on_mgmt_stage(update: Update, chat_id: int, row_id: str, stage: int):
-    if stage not in (1, 2, 3, 4): return
-    week_key = await get_latest_week_key()
-    await set_management_stage(week_key, row_id, stage)
-    await _show_management_detail(update, chat_id, row_id, edit=True)
-
-
-def _count_remaining(row: dict, stage: int) -> int:
-    items = STAGE_ITEMS.get(stage, [])
-    return sum(1 for field, _ in items if not row.get(field))
-
-
-async def _send_or_edit(update: Update, edit: bool, text: str,
-                        reply_markup=None, parse_mode=None):
-    if edit and update.callback_query:
-        try:
-            await update.callback_query.edit_message_text(
-                text, reply_markup=reply_markup, parse_mode=parse_mode
-            )
-            return
-        except Exception as e:
-            # "Message is not modified" 같은 경우 그냥 무시
-            if "not modified" in str(e).lower():
-                return
-            # 그 외 실패 시 새 메시지로 전송 (아래)
-            logger.debug("edit_message_text failed, falling back to send: %s", e)
-    target_msg = update.message or (update.callback_query.message if update.callback_query else None)
-    if target_msg:
-        await target_msg.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+async def _on_sp_unregister(update: Update, chat_id: int, dept: str, name: str, phone: str):
+    await sb_rpc("unregister_special_management", {
+        "p_dept": dept, "p_name": name, "p_phone_last4": phone
+    })
+    q = update.callback_query
+    await q.edit_message_text(
+        f"🗑 *{md(name)}* 님을 특별관리에서 해제했습니다.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("◀ 메인 메뉴", callback_data="menu:home")]
+        ]),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 일일 리마인더 (JobQueue)
+# 매주 화요일 19시 KST — 주간 항목 리셋 + 리마인더 전송
 # ─────────────────────────────────────────────────────────────────────────────
-async def daily_reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    """매일 등록된 관리대책방들로 미체크 항목 요약 전송."""
-    logger.info("🔔 daily_reminder_job start")
+async def weekly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("🔔 weekly_reminder_job start (Tuesday 19:00 KST)")
     try:
-        week_key = await get_latest_week_key()
-        if not week_key:
-            logger.info("no week_key; skipping reminder")
-            return
-        targets = await get_management_targets(week_key)
-        admin_chats = await get_admin_chats()
-        if not admin_chats:
-            logger.info("no admin chats registered; skipping reminder")
+        # 1) 모든 대상 조회
+        targets = await sb_rpc("get_all_special_targets", {}) or []
+        if not targets:
+            logger.info("no special targets; nothing to do")
+            # 그래도 주간 리셋은 수행
+            await sb_rpc("reset_special_weekly_items", {})
             return
 
-        today = datetime.now(KST).date().isoformat()
-        pending = []
+        # 2) 리마인더 전송 (리셋 *이전*에 — 금주 정보로 알림)
         for t in targets:
-            stage = int(t.get("current_stage") or 1)
-            if stage not in STAGE_ITEMS:
-                stage = 1
-            items = STAGE_ITEMS[stage]
-            unchecked = [(field, label) for field, label in items if not t.get(field)]
-            if not unchecked:
+            chat_id = t.get("monitor_chat_id")
+            if not chat_id:
                 continue
-            last = t.get("last_reminder_date")
-            if last and str(last) == today:
-                continue
-            pending.append((t, stage, unchecked))
-
-        if not pending:
-            logger.info("nothing pending; skipping reminder")
-            return
-
-        # ── 메시지 빌드 ────────────────────────────────────────────────
-        header = (
-            f"🔔 *일일 관리 리마인더* ({datetime.now(KST).strftime('%Y-%m-%d %H:%M')})\n"
-            f"주차: `{week_key}`\n"
-            f"미체크 항목이 있는 관리대상 {len(pending)}명\n"
-            "━━━━━━━━━━━━━━━━━━━━"
-        )
-        footer = "\n/관리대상 으로 체크하러 가기"
-
-        # 사람별 블록들을 만들고, 길이에 맞춰 묶어서 여러 메시지로 분할
-        blocks = []
-        for t, stage, unchecked in pending:
             name   = t.get("name", "?")
             dept   = t.get("dept", "")
-            region = t.get("region_name", "")
-            streak = t.get("consecutive_absent_count", "")
-            block_lines = [
-                f"\n👤 *{md(name)}* ({md(dept)}/{md(region)}) · 연속{streak}회 · *{STAGE_TITLES[stage]}*"
-            ]
-            for _, label in unchecked:
-                block_lines.append(f"  ⬜️ {label}")
-            blocks.append("\n".join(block_lines))
+            region = t.get("region_name", "") or ""
+            zone   = t.get("zone_name", "") or ""
 
-        # 분할 묶기
-        messages = []
-        current = header
-        for block in blocks:
-            if len(current) + len(block) + len(footer) > TG_MAX_LEN:
-                messages.append(current + footer)
-                current = header + block
+            unchecked = []
+            if not t.get("item1_chat_invited"):
+                unchecked.append("⬜️ 1. 대책방 초대완료 (최초 1회)")
+            if not t.get("item2_feedback_done"):
+                unchecked.append("⬜️ 2. 금주 피드백 진행")
+            if not (t.get("item3_visit_date") or ""):
+                unchecked.append("⬜️ 3. 금주 심방예정일 (미입력)")
+            if not (t.get("item4_visit_plan") or ""):
+                unchecked.append("⬜️ 4. 금주 심방계획 (미입력)")
+
+            if not unchecked:
+                msg = (
+                    f"🔔 *주간 리마인더*\n"
+                    f"👤 {md(name)} ({md(dept)} / {md(region)} {md(zone)})\n\n"
+                    f"✅ 모든 항목이 체크되어 있습니다. 수고하셨습니다!\n\n"
+                    f"_내일부터 2~4번 항목은 초기화되어 다시 작성해야 합니다._"
+                )
             else:
-                current += "\n" + block
-        messages.append(current + footer)
+                msg = (
+                    f"🔔 *주간 리마인더* (화요일 {WEEKLY_REMINDER_HOUR}시)\n"
+                    f"👤 *{md(name)}* ({md(dept)} / {md(region)} {md(zone)})\n\n"
+                    f"미체크 항목:\n" + "\n".join(unchecked) +
+                    f"\n\n/menu → 🚨 특별관리결석자 → {md(dept)} → 선택하여 업데이트하세요."
+                )
 
-        # ── 전송 ──────────────────────────────────────────────────────
-        for ch in admin_chats:
-            for idx, text in enumerate(messages):
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+            except Exception as e:
+                logger.warning("send to chat %s failed: %s", chat_id, e)
                 try:
                     await context.bot.send_message(
-                        chat_id=ch["chat_id"],
-                        text=text,
-                        parse_mode="Markdown",
+                        chat_id=chat_id,
+                        text=msg.replace("*", "").replace("`", "").replace("_", "")
                     )
-                except Exception as e:
-                    # Markdown 파싱 실패 시 일반 텍스트로 재시도
-                    logger.warning("send markdown failed (%s), retry plain: %s",
-                                   ch.get("chat_id"), e)
-                    try:
-                        await context.bot.send_message(
-                            chat_id=ch["chat_id"],
-                            text=text.replace("*", "").replace("`", ""),
-                        )
-                    except Exception as e2:
-                        logger.warning("send plain also failed: %s", e2)
+                except Exception as e2:
+                    logger.warning("plain send also failed: %s", e2)
 
-        # 중복 전송 방지 기록
-        for t, *_ in pending:
+            # 기록
             try:
-                await mark_management_reminder(week_key, t["row_id"])
-            except Exception as e:
-                logger.warning("mark reminder failed: %s", e)
+                await sb_rpc("mark_special_reminder_sent", {
+                    "p_dept": dept, "p_name": name, "p_phone_last4": t.get("phone_last4", "") or ""
+                })
+            except Exception:
+                pass
+
+        # 3) 주간 항목 리셋 (2/3/4번 초기화, 1번은 유지)
+        await sb_rpc("reset_special_weekly_items", {})
+        logger.info("weekly reset done")
 
     except Exception as e:
-        logger.exception("daily_reminder_job failed: %s", e)
+        logger.exception("weekly_reminder_job failed: %s", e)
 
 
-async def force_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔔 리마인더 강제 실행 중...")
-    await daily_reminder_job(context)
+async def force_weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """테스트용 — 즉시 주간 리마인더 실행"""
+    await update.message.reply_text("🔔 주간 리마인더 강제 실행 중...")
+    await weekly_reminder_job(context)
     await update.message.reply_text("✅ 완료")
 
 
@@ -900,27 +1040,76 @@ async def force_reminder_command(update: Update, context: ContextTypes.DEFAULT_T
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await clear_tmp(chat_id)
-    await update.message.reply_text("🚫 현재 작업이 취소됐습니다.")
+    await update.message.reply_text("🚫 현재 작업이 취소됐습니다.\n/menu 로 메인 메뉴.")
+
+
+HELP_TEXT = (
+    "📖 *결석자 타겟 심방 봇 사용법*\n"
+    "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    "*🔹 기본 명령어*\n"
+    "• /start 또는 /menu — 메인 메뉴 열기\n"
+    "• /도움말 — 이 안내 보기\n"
+    "• /취소 — 현재 입력 취소\n\n"
+
+    "*🔹 메인 메뉴 3가지 기능*\n\n"
+
+    "📋 *1) 결석자 — 일반 심방 기록*\n"
+    "① `📋 결석자` 버튼 탭\n"
+    "② 부서 선택 (자문회/장년회/부녀회/청년회)\n"
+    "③ *지역* 또는 *구역*을 입력\n"
+    "   • 지역 예: `강북`, `강남`, `강서`, `강동`\n"
+    "   • 구역 예: `2-1` 또는 `2팀1` (둘 다 동일하게 인식)\n"
+    "④ 나온 결석자 버튼 선택\n"
+    "⑤ 8단계 입력: 심방자 → 심방날짜 → 심방계획 → 타겟여부 → 진행여부 → 예배확답 → 진행사항 → 예배참석\n"
+    "⑥ 확인 후 ✅ 저장\n\n"
+
+    "🚨 *2) 특별관리결석자 — 4회 이상 관리*\n"
+    "① `🚨 특별관리결석자` 버튼 탭\n"
+    "② 부서 선택\n"
+    "③ 연속결석 4회 이상 명단에서 대상 선택\n"
+    "   → *현재 이 방이 감지방으로 등록됨*\n"
+    "④ 4항목 체크리스트 관리:\n"
+    "   1️⃣ 대책방 초대완료 (최초 1회)\n"
+    "   2️⃣ 금주 피드백 진행 (매주 리셋)\n"
+    "   3️⃣ 금주 심방예정일 (매주 리셋)\n"
+    "   4️⃣ 금주 심방계획 (매주 리셋)\n"
+    f"⑤ 매주 화요일 {WEEKLY_REMINDER_HOUR:02d}:{WEEKLY_REMINDER_MIN:02d}(KST) 에 미체크 항목 리마인더 자동 발송\n\n"
+
+    "*🔹 자동 주차 계산*\n"
+    "화요일 18시 KST 기준으로 자동 전환됩니다.\n"
+    "• 화요일 18시 이전 → 지난 주일 주차\n"
+    "• 화요일 18시 이후 → 이번 주일 주차\n\n"
+
+    "*🔹 연속결석 횟수 표시*\n"
+    "업로드된 숫자에 이번 주 결석 1회가 이미 더해진 값입니다.\n"
+    "(화요일 18시 업로드 시 자동 +1 처리)\n\n"
+
+    "*🔹 문제 해결*\n"
+    "• '결석자가 없습니다' → 지역/구역명 확인 or 명단 업로드 확인\n"
+    "• 구역 형식: `N-M` 또는 `N팀M` 둘 다 OK\n"
+    "• 언제든 /menu 로 처음부터 다시 시작 가능"
+)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 *사용법*\n\n"
-        "*심방 기록*\n"
-        "/자문회 강북 — 자문회 강북 결석자 목록\n"
-        "/장년회 강남 — 장년회 강남 결석자 목록\n"
-        "/부녀회 강서 — 부녀회 강서 결석자 목록\n"
-        "/청년회 강동 — 청년회 강동 결석자 목록\n"
-        "/취소 — 현재 입력 취소\n\n"
-        "*연속결석 4회 이상 관리*\n"
-        "/관리대책방등록 — 이 방을 관리대책방으로 등록\n"
-        "/관리대책방해제 — 이 방의 등록 해제\n"
-        "/관리대상 — 4회 이상 결석자 단계 체크리스트\n"
-        "/관리확인 — 일일 리마인더 즉시 실행 (테스트)\n\n"
-        "결석자 선택 → 안내 따라 입력 → Supabase DB 자동 저장\n"
-        f"일일 리마인더: 매일 {REMINDER_HOUR:02d}:{REMINDER_MIN:02d}(KST)",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+
+
+async def _show_help(update: Update, edit: bool = False):
+    q = update.callback_query
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀ 메인 메뉴", callback_data="menu:home")]
+    ])
+    if edit and q:
+        try:
+            await q.edit_message_text(HELP_TEXT, parse_mode="Markdown", reply_markup=kb)
+            return
+        except Exception:
+            pass
+    target = update.message or (q.message if q else None)
+    if target:
+        await target.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=kb)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -929,38 +1118,34 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # 부서 명령어
-    DEPT_NAMES = ["자문회", "장년회", "부녀회", "청년회"]
-    for dept in DEPT_NAMES:
-        app.add_handler(CommandHandler(dept, dept_region_command))
-
-    app.add_handler(CommandHandler("취소",            cancel_command))
-    app.add_handler(CommandHandler("도움말",          help_command))
-    app.add_handler(CommandHandler("관리대책방등록",   register_admin_chat_command))
-    app.add_handler(CommandHandler("관리대책방해제",   unregister_admin_chat_command))
-    app.add_handler(CommandHandler("관리대상",        management_list_command))
-    app.add_handler(CommandHandler("관리확인",        force_reminder_command))
+    # 기본 명령어
+    app.add_handler(CommandHandler("start",    start_command))
+    app.add_handler(CommandHandler("menu",     menu_command))
+    app.add_handler(CommandHandler("도움말",   help_command))
+    app.add_handler(CommandHandler("help",     help_command))
+    app.add_handler(CommandHandler("취소",     cancel_command))
+    app.add_handler(CommandHandler("cancel",   cancel_command))
+    app.add_handler(CommandHandler("주간알림테스트", force_weekly_command))
 
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
 
-    # ── 일일 리마인더 스케줄 등록 (KST) ──
+    # 매주 화요일 19시 KST 리마인더
     if app.job_queue is not None:
         app.job_queue.run_daily(
-            daily_reminder_job,
-            time=dtime(hour=REMINDER_HOUR, minute=REMINDER_MIN, tzinfo=KST),
-            name="daily_reminder",
+            weekly_reminder_job,
+            time=dtime(hour=WEEKLY_REMINDER_HOUR, minute=WEEKLY_REMINDER_MIN, tzinfo=KST),
+            days=(1,),  # 1 = 화요일 (월=0, 화=1, ..., 일=6 in python-telegram-bot v20)
+            name="weekly_special_reminder",
         )
-        logger.info("📅 daily reminder scheduled at %02d:%02d KST",
-                    REMINDER_HOUR, REMINDER_MIN)
+        logger.info("📅 weekly reminder scheduled: Tuesday %02d:%02d KST",
+                    WEEKLY_REMINDER_HOUR, WEEKLY_REMINDER_MIN)
     else:
-        logger.warning("⚠ JobQueue is not available. "
-                       "pip install 'python-telegram-bot[job-queue]' 필요")
+        logger.warning("⚠ JobQueue is not available.")
 
     port = int(os.environ.get("PORT", 8080))
     webhook_url = os.environ["WEBHOOK_URL"]
     logger.info(f"Starting webhook on port={port}, url={webhook_url}")
-
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
