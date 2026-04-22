@@ -15,7 +15,7 @@ import logging
 import httpx
 from datetime import datetime
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -41,10 +41,6 @@ HEADERS = {
 }
 
 # ── 입력 단계 순서 ─────────────────────────────────────────────────────────────
-
-DEPT_NAMES = ["자문회", "장년회", "부녀회", "청년회"]
-DEPT_COMMAND_REGEX = re.compile(r"^/(?P<dept>자문회|장년회|부녀회|청년회)(?:@\w+)?(?:\s+(?P<region>.+))?$")
-
 STEPS = ["shepherd", "date", "plan", "target", "done", "worship", "note", "attendance"]
 STEP_LABELS = {
     "shepherd":   "👤 심방자 (예: 홍길동(집사))",
@@ -148,15 +144,14 @@ async def upsert_progress(week_key: str, row_id: str, ctx: dict):
 
 # ── /부서 지역 명령어 ───────────────────────────────────────────────────────────
 async def dept_region_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/자문회 강북 또는 /장년회 강남 형태를 일반 텍스트처럼 직접 파싱"""
-    cmd_text = (update.message.text or "").strip()
-    m = DEPT_COMMAND_REGEX.match(cmd_text)
-    if not m:
-        await update.message.reply_text("❗ 형식이 올바르지 않습니다. 예) /자문회 강북")
-        return
-
-    dept = m.group("dept")
-    region = (m.group("region") or "").strip()
+    """
+    /자문회 강북  or  /장년회 강남  등의 커맨드 처리
+    커맨드 이름 자체가 부서명 (슬래시 뒤)
+    """
+    cmd_text = update.message.text.strip()  # 예: /자문회 강북
+    parts = cmd_text.split(None, 1)
+    dept = parts[0].lstrip("/")             # 자문회
+    region = parts[1].strip() if len(parts) > 1 else ""
 
     if not region:
         await update.message.reply_text(
@@ -407,15 +402,6 @@ async def _do_save(update: Update, chat_id: int):
         await query.message.reply_text(f"❌ 저장 실패: {e}")
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "안녕하세요. 결석자 타겟 심방 봇입니다.\n"
-        "사용 예시: /자문회 강북\n"
-        "도움말: /도움말\n"
-        "취소: /취소"
-    )
-
-
 # ── /취소 명령어 ────────────────────────────────────────────────────────────────
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -439,43 +425,31 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── 앱 시작 ─────────────────────────────────────────────────────────────────────
-async def post_init(app: Application):
-    try:
-        await app.bot.set_my_commands([
-            BotCommand("start", "시작"),
-            BotCommand("도움말", "사용법 보기"),
-            BotCommand("취소", "현재 입력 취소"),
-        ])
-    except Exception:
-        logger.exception("Failed to set bot commands")
-
-
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # 표준 명령어
-    app.add_handler(CommandHandler("start", start_command))
+    # 부서 명령어 등록
+    DEPT_NAMES = ["자문회", "장년회", "부녀회", "청년회"]
+    for dept in DEPT_NAMES:
+        app.add_handler(CommandHandler(dept, dept_region_command))
+
     app.add_handler(CommandHandler("취소", cancel_command))
     app.add_handler(CommandHandler("도움말", help_command))
-
-    # 한글 슬래시 입력은 Telegram 명령어로 안정적으로 인식되지 않을 수 있어 텍스트 정규식으로 처리
-    app.add_handler(MessageHandler(filters.Regex(DEPT_COMMAND_REGEX), dept_region_command))
-
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
 
     port = int(os.environ.get("PORT", 8080))
-    webhook_url = os.environ["WEBHOOK_URL"]  # 반드시 https://.../webhook 전체 경로
+    webhook_url = os.environ["WEBHOOK_URL"]  # https://your-cloud-run-url/webhook
 
     logger.info(f"Starting webhook on port={port}, url={webhook_url}")
 
+    # Cloud Run: listen 0.0.0.0, url_path는 /webhook 고정
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
-        url_path="webhook",
+        url_path="webhook",          # ← 슬래시 없이 (PTB가 자동으로 붙임)
         webhook_url=webhook_url,
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,   # 재시작 시 쌓인 메시지 무시
     )
 
 
