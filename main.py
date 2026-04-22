@@ -21,6 +21,7 @@ import re
 import json
 import logging
 import httpx
+from urllib.parse import quote
 from datetime import datetime, time as dtime, timezone, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -126,6 +127,8 @@ async def sb_get(path: str):
     async with httpx.AsyncClient() as client:
         r = await client.get(f"{SUPABASE_URL}/rest/v1/{path}", headers=HEADERS, timeout=15)
         r.raise_for_status()
+        if not r.content or not r.content.strip():   # 빈 응답 방어
+            return []
         return r.json()
 
 async def sb_rpc(func: str, payload: dict):
@@ -171,13 +174,24 @@ async def get_latest_week_key() -> str:
         logger.warning("get_latest_week_key failed: %s", e)
     return ""
 
+async def get_recent_weeks(limit: int = 6):
+    """최근 주차 목록 (week_key, week_label) 반환."""
+    try:
+        rows = await sb_get(
+            f"weekly_target_weeks?select=week_key,week_label&order=week_key.desc&limit={limit}"
+        )
+        return rows or []
+    except Exception as e:
+        logger.warning("get_recent_weeks failed: %s", e)
+        return []
+
 async def get_absentees(week_key: str, dept: str, region: str):
     path = (
         f"weekly_visit_targets"
         f"?select=row_id,name,phone_last4,region_name,zone_name,consecutive_absent_count"
-        f"&week_key=eq.{week_key}"
-        f"&dept=eq.{dept}"
-        f"&region_name=eq.{region}"
+        f"&week_key=eq.{quote(week_key, safe='')}"
+        f"&dept=eq.{quote(dept, safe='')}"
+        f"&region_name=eq.{quote(region, safe='')}"
         f"&order=row_order.asc"
     )
     return await sb_get(path)
@@ -243,7 +257,7 @@ async def get_admin_chats():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 기존 /부서 지역 명령어
+# /부서 지역 명령어 → 주차 확인 메뉴 먼저 표시
 # ─────────────────────────────────────────────────────────────────────────────
 async def dept_region_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cmd_text = update.message.text.strip()
@@ -255,44 +269,42 @@ async def dept_region_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"❗ 지역을 함께 입력해주세요.\n예) /{dept} 강북")
         return
 
-    await update.message.reply_text("🔍 결석자 목록을 불러오는 중...")
-
     try:
-        week_key = await get_latest_week_key()
-        if not week_key:
-            await update.message.reply_text("❌ 등록된 주차 데이터가 없습니다.")
+        # 최신 주차 + 최근 주차 목록 동시 조회
+        latest_key = await get_latest_week_key()
+        if not latest_key:
+            await update.message.reply_text("❌ 등록된 주차 데이터가 없습니다.\n웹 대시보드에서 명단을 먼저 업로드해주세요.")
             return
 
-        absentees = await get_absentees(week_key, dept, region)
-        if not absentees:
-            await update.message.reply_text(
-                f"📭 [{dept} / {region}] 결석자가 없습니다.\n(주차: {week_key})"
-            )
-            return
+        recent_weeks = await get_recent_weeks(6)
 
+        # dept / region 을 컨텍스트에 임시 저장 (week 미확정)
         chat_id = update.effective_chat.id
-        await save_ctx(chat_id,
-            active_week_key=week_key,
-            dept_filter=dept,
-            region_filter=region,
+        await save_ctx(chat_id, dept_filter=dept, region_filter=region)
+
+        # 최신 주차 라벨 찾기
+        latest_label = next(
+            (w.get("week_label", latest_key) for w in recent_weeks if w.get("week_key") == latest_key),
+            latest_key,
         )
 
-        buttons = []
-        row = []
-        for ab in absentees:
-            name = ab.get("name", "?")
-            phone = ab.get("phone_last4", "")
-            streak = ab.get("consecutive_absent_count", "")
-            label = f"{name}({phone}) 연속{streak}회"
-            row.append(InlineKeyboardButton(label, callback_data=f"select:{ab['row_id']}"))
-            if len(row) == 2:
-                buttons.append(row); row = []
-        if row: buttons.append(row)
+        # ── 버튼 구성 ──────────────────────────────────────────────────────
+        buttons = [
+            [InlineKeyboardButton(
+                f"✅ 이 주차로 진행  ({latest_label})",
+                callback_data=f"week_confirm:{latest_key}",
+            )]
+        ]
+        # 이전 주차가 있으면 '다른 주차 선택' 버튼 추가
+        if len(recent_weeks) > 1:
+            buttons.append([
+                InlineKeyboardButton("🔄 다른 주차 선택", callback_data="week_select")
+            ])
 
         await update.message.reply_text(
-            f"📋 *{dept} / {region}* 결석자 목록\n"
-            f"주차: `{week_key}` | 총 {len(absentees)}명\n\n"
-            f"심방 기록할 결석자를 선택하세요 👇",
+            f"📋 *{md(dept)} / {md(region)}*\n\n"
+            f"📅 현재 최신 주차: *{md(latest_label)}*\n"
+            f"어느 주차 결석자를 조회할까요?",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
@@ -322,6 +334,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "cancel_save":
             await clear_tmp(chat_id)
             await query.message.reply_text("🚫 저장이 취소됐습니다.")
+        # ── 주차 확인 ──
+        elif data.startswith("week_confirm:"):
+            week_key = data.split(":", 1)[1]
+            await _on_week_confirmed(update, chat_id, week_key)
+        elif data == "week_select":
+            await _on_week_select(update, chat_id)
+        elif data.startswith("week_pick:"):
+            week_key = data.split(":", 1)[1]
+            await _on_week_confirmed(update, chat_id, week_key)
         # ── 관리단계 ──
         elif data == "mgmt_back":
             await _show_management_list(update, chat_id, edit=True)
@@ -340,6 +361,82 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"❌ 오류: {e}")
         except Exception:
             pass
+
+
+async def _on_week_confirmed(update: Update, chat_id: int, week_key: str):
+    """주차 확정 → 결석자 목록 표시."""
+    query = update.callback_query
+    ctx = await get_ctx(chat_id)
+    if not ctx:
+        await query.message.reply_text("❌ 세션이 만료됐습니다. 다시 명령어를 입력해주세요.")
+        return
+
+    dept   = ctx.get("dept_filter", "")
+    region = ctx.get("region_filter", "")
+
+    # week_key 를 컨텍스트에 저장
+    await save_ctx(chat_id, active_week_key=week_key)
+
+    # 주차 라벨 조회
+    try:
+        wrows = await sb_get(
+            f"weekly_target_weeks?select=week_label&week_key=eq.{quote(week_key, safe='')}&limit=1"
+        )
+        week_label = wrows[0].get("week_label", week_key) if wrows else week_key
+    except Exception:
+        week_label = week_key
+
+    await query.edit_message_text(f"🔍 *{md(dept)} / {md(region)}* 결석자 불러오는 중…", parse_mode="Markdown")
+
+    absentees = await get_absentees(week_key, dept, region)
+    if not absentees:
+        await query.edit_message_text(
+            f"📭 [{dept} / {region}] 결석자가 없습니다.\n(주차: {week_label})"
+        )
+        return
+
+    buttons = []
+    row = []
+    for ab in absentees:
+        name   = ab.get("name", "?")
+        phone  = ab.get("phone_last4", "")
+        streak = ab.get("consecutive_absent_count", "")
+        label  = f"{name}({phone}) 연속{streak}회"
+        row.append(InlineKeyboardButton(label, callback_data=f"select:{ab['row_id']}"))
+        if len(row) == 2:
+            buttons.append(row); row = []
+    if row:
+        buttons.append(row)
+
+    await query.edit_message_text(
+        f"📋 *{md(dept)} / {md(region)}* 결석자 목록\n"
+        f"주차: `{week_label}` | 총 {len(absentees)}명\n\n"
+        f"심방 기록할 결석자를 선택하세요 👇",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _on_week_select(update: Update, chat_id: int):
+    """주차 목록 버튼 메뉴 표시."""
+    query = update.callback_query
+    recent_weeks = await get_recent_weeks(6)
+    if not recent_weeks:
+        await query.answer("조회 가능한 주차가 없습니다.", show_alert=True)
+        return
+
+    buttons = [
+        [InlineKeyboardButton(
+            f"📅 {w.get('week_label', w.get('week_key', '?'))}",
+            callback_data=f"week_pick:{w.get('week_key', '')}",
+        )]
+        for w in recent_weeks
+    ]
+
+    await query.edit_message_text(
+        "🗓 조회할 주차를 선택하세요:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
 async def _on_select_absentee(update: Update, chat_id: int, row_id: str):
