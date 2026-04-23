@@ -1319,8 +1319,12 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "m:home":
             await _show_home(update)
         elif data == "m:absentee":
+            # 🔧 일반 결석자 심방 진입 시 이전 특별관리 컨텍스트 완전 제거
+            await clear_tmp(chat_id)
             await _show_church_select(update, "abs")
         elif data == "m:special":
+            # 🔧 특별관리 진입 시 이전 결석자 심방 컨텍스트 완전 제거
+            await clear_tmp(chat_id)
             await _show_church_select(update, "sp")
         elif data == "m:help":
             # 사용법은 HTML parse_mode (명령어 탭 복사 지원)
@@ -1350,6 +1354,13 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("abs_sel:"):
             row_id = data.split(":", 1)[1]
             await _on_abs_select(update, chat_id, row_id)
+        # 🆕 개별 항목 수정 흐름
+        elif data.startswith("edit_step:"):
+            step = data.split(":", 1)[1]
+            await _on_edit_step(update, chat_id, step)
+        elif data.startswith("edit_full:"):
+            row_id = data.split(":", 1)[1]
+            await _on_edit_full(update, chat_id, row_id)
         elif data.startswith("choice:"):
             _, step, value = data.split(":", 2)
             await _on_choice(update, chat_id, step, value)
@@ -1713,9 +1724,13 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pre_step = (ctx_pre.get("editing_step", "") if ctx_pre else "") or ""
     if not pre_step:
         if text == "📋 결석자 심방":
+            # 🔧 이전 특별관리 컨텍스트 제거
+            await clear_tmp(chat_id)
             await _show_church_menu(update, "abs")
             return
         if text == "🚨 특별관리결석자":
+            # 🔧 이전 결석자 심방 컨텍스트 제거
+            await clear_tmp(chat_id)
             await _show_church_menu(update, "sp")
             return
         if text == "📘 사용법":
@@ -1855,6 +1870,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2) 특별관리 3·4번 텍스트 입력
     if step in ("awaiting_sp3", "awaiting_sp4"):
+        import html as _html
         church = ctx.get("church_filter", "")
         dept   = ctx.get("dept_filter", "")
         name   = ctx.get("tmp_sp_name", "")
@@ -1871,14 +1887,21 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await save_ctx(chat_id, editing_step="")
         label_ko = "심방예정일" if which == "3" else "심방계획"
-        await update.message.reply_text(
-            f"✅ *금주 {label_ko}* 저장됨: `{md(text)}`",
-            parse_mode="Markdown",
-        )
+        try:
+            await update.message.reply_text(
+                f"✅ <b>금주 {label_ko}</b> 저장됨: <code>{_html.escape(str(text))}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            await update.message.reply_text(f"✅ 금주 {label_ko} 저장됨: {text}")
         await _show_sp_detail(update, chat_id, church, dept, name, phone, send_new=True)
         return
 
-    # 3) 일반 심방 입력 단계
+    # 3) 일반 심방 입력 단계 (일반 또는 단일 편집 모드 'edit_<step>')
+    is_single_edit = step.startswith("edit_")
+    if is_single_edit:
+        step = step[5:]  # 'edit_shepherd' → 'shepherd'
+
     if step in STEPS:
         # 🛡 검증 1: 리플라이 키보드 라벨이면 "입력 안 함"으로 간주하고 에러 안내
         RESERVED_LABELS = {
@@ -1972,14 +1995,74 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        # ✅ 검증 통과 - 저장 후 다음 단계
+        # ✅ 검증 통과 - 저장
         tmp_key = f"tmp_{step}"
         await save_ctx(chat_id, **{tmp_key: text})
+
+        # 🔧 단일 편집 모드: DB에 바로 저장 + 수정 메뉴 복귀
+        if is_single_edit:
+            await _save_single_edit_and_show_menu(update, chat_id)
+            return
+
+        # 일반 흐름: 다음 단계로
         step_idx = STEPS.index(step)
         await _next_step(update, chat_id, step_idx, ctx)
 
 
+async def _save_single_edit_and_show_menu(update, chat_id: int):
+    """단일 항목 편집 완료 → DB 저장 + 수정 메뉴 재표시"""
+    import html as _html
+    ctx = await get_ctx(chat_id)
+    if not ctx:
+        return
+    week_key = ctx.get("active_week_key", "")
+    row_id = ctx.get("editing_row_id", "")
+    if not week_key or not row_id:
+        await update.message.reply_text("❌ 편집 대상 정보 없음. /menu")
+        return
+
+    try:
+        await upsert_progress(week_key, row_id, ctx)
+    except Exception as e:
+        logger.exception(e)
+        await update.message.reply_text(f"❌ 저장 실패: {str(e)[:200]}")
+        return
+
+    # editing_step 초기화
+    await save_ctx(chat_id, editing_step="")
+
+    # 최신 progress 다시 조회 후 메뉴 재표시
+    prog = await get_progress(week_key, row_id)
+    rows = await sb_get(
+        f"weekly_visit_targets?select=name&row_id=eq.{quote(row_id)}"
+    )
+    name = rows[0]["name"] if rows else row_id
+    if rows:
+        enriched = await enrich_names(rows)
+        if enriched:
+            name = enriched[0].get("name", name) or name
+
+    try:
+        await update.message.reply_text(
+            f"✅ <b>{_html.escape(str(name))}</b> — 수정 저장 완료",
+            parse_mode="HTML",
+        )
+    except Exception:
+        await update.message.reply_text(f"✅ {name} — 수정 저장 완료")
+
+    # 수정 메뉴 재표시
+    class FakeQ:
+        message = update.message
+    class FakeUpd:
+        callback_query = FakeQ()
+        effective_chat = update.effective_chat
+        message = update.message
+    if prog:
+        await _show_edit_menu(FakeUpd(), chat_id, row_id, name, prog)
+
+
 async def _on_abs_select(update: Update, chat_id: int, row_id: str):
+    import html as _html
     q = update.callback_query
     ctx = await get_ctx(chat_id)
     if not ctx:
@@ -1993,37 +2076,240 @@ async def _on_abs_select(update: Update, chat_id: int, row_id: str):
         f"&row_id=eq.{quote(row_id)}&week_key=eq.{quote(week_key)}"
     )
     if rows:
-        # 이름 마스킹 복구 시도
         enriched = await enrich_names(rows)
         name = enriched[0]["name"] if enriched else row_id
     else:
         name = row_id
 
-    await save_ctx(chat_id, editing_row_id=row_id, editing_step="shepherd")
+    # 🔧 저장된 기록이 있고 모든 필드가 채워져 있으면 → 수정 메뉴 표시
+    # 부분 기록이면 → 빠진 곳부터 이어서 입력
+    has_record = bool(prog)
+    all_filled = has_record and all(
+        (prog.get(k) is not None and prog.get(k) != "")
+        for k in ["shepherd", "visit_date_display", "plan_text"]
+    )
 
-    # 🛡 HTML parse_mode 사용 (Markdown 보다 관대하여 특수문자 이름에도 파싱 에러 없음)
-    import html as _html
+    if all_filled:
+        # 저장된 기록 있음 → 수정 메뉴
+        await _show_edit_menu(update, chat_id, row_id, name, prog)
+        return
+
+    # 신규 기록 또는 부분 기록 → 빈 필드부터 이어서 입력
+    # 다음 비어있는 필드 찾기
+    start_step = "shepherd"
+    if has_record:
+        for s in STEPS:
+            key_map = {
+                "shepherd":"shepherd", "date":"visit_date_display", "plan":"plan_text",
+                "target":"is_target", "done":"is_done", "worship":"attend_confirm",
+                "note":"note", "attendance":"attendance"
+            }
+            dbkey = key_map.get(s, s)
+            val = prog.get(dbkey)
+            if val is None or val == "":
+                start_step = s
+                break
+        else:
+            start_step = "shepherd"  # 모두 채워진 경우는 위에서 처리됨
+
+        # 기존 값들을 tmp_* 에 채워넣어서 저장 시 덮어쓰기 기반으로
+        await save_ctx(
+            chat_id,
+            tmp_shepherd   = prog.get("shepherd", "") or "",
+            tmp_date       = prog.get("visit_date_display", "") or "",
+            tmp_plan       = prog.get("plan_text", "") or "",
+            tmp_target     = "타겟" if prog.get("is_target") else ("미타겟" if prog.get("is_target") is False else ""),
+            tmp_done       = "완료" if prog.get("is_done") else ("미완료" if prog.get("is_done") is False else ""),
+            tmp_worship    = prog.get("attend_confirm", "") or "",
+            tmp_note       = prog.get("note", "") or "",
+            tmp_attendance = prog.get("attendance", "") or "",
+        )
+
+    await save_ctx(chat_id, editing_row_id=row_id, editing_step=start_step)
+
     existing = ""
-    if prog:
+    if has_record:
         existing = (
             f"\n\n📂 <b>기존 입력값</b>\n"
             f"심방자: {_html.escape(prog.get('shepherd','') or '없음')}\n"
             f"심방날짜: {_html.escape(prog.get('visit_date_display','') or '없음')}\n"
-            f"진행여부: {'완료' if prog.get('is_done') else '미완료'}"
+            f"심방계획: {_html.escape((prog.get('plan_text','') or '없음')[:50])}\n"
+            f"<i>빠진 부분부터 이어서 입력하세요.</i>"
         )
+
+    step_idx = STEPS.index(start_step) + 1
+    try:
+        await q.message.reply_text(
+            f"✏️ <b>{_html.escape(str(name))}</b> 님 심방 기록{existing}\n\n"
+            f"{step_idx}️⃣ {_html.escape(STEP_LABELS[start_step])}\n입력해주세요:\n\n"
+            f"<i>중단하려면 ❌ 취소 버튼 또는 /cancel</i>",
+            parse_mode="HTML",
+            reply_markup=kb_cancel_only() if start_step not in STEP_CHOICES else _kb_choice(start_step),
+        )
+    except Exception as e:
+        logger.warning("HTML parse 실패, 평문으로 전송: %s", e)
+        await q.message.reply_text(
+            f"✏️ {name} 님 심방 기록\n\n"
+            f"{step_idx}️⃣ {STEP_LABELS[start_step]}\n입력해주세요:",
+            reply_markup=kb_cancel_only() if start_step not in STEP_CHOICES else _kb_choice(start_step),
+        )
+
+
+def _kb_choice(step: str) -> InlineKeyboardMarkup:
+    """선택형 단계의 인라인 버튼 생성"""
+    rows = STEP_CHOICES.get(step, [])
+    keyboard = [
+        [InlineKeyboardButton(c, callback_data=f"choice:{step}:{c}") for c in row]
+        for row in rows
+    ]
+    keyboard.append([InlineKeyboardButton("❌ 취소", callback_data="flow_cancel")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def _show_edit_menu(update, chat_id: int, row_id: str, name: str, prog: dict):
+    """저장된 심방 기록의 수정 메뉴 (각 항목별 개별 수정)"""
+    import html as _html
+    q = update.callback_query
+
+    # 현재 저장된 값 표시
+    def fmt(v, true_label="✅", false_label="❌"):
+        if v is None or v == "": return "<i>미입력</i>"
+        if isinstance(v, bool): return true_label if v else false_label
+        return _html.escape(str(v))
+
+    text = (
+        f"📝 <b>{_html.escape(str(name))}</b> 님 심방 기록 (저장됨)\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"① 심방자: {fmt(prog.get('shepherd'))}\n"
+        f"② 심방날짜: {fmt(prog.get('visit_date_display'))}\n"
+        f"③ 심방계획: {fmt(prog.get('plan_text'))}\n"
+        f"④ 타겟여부: {fmt(prog.get('is_target'), '타겟', '미타겟')}\n"
+        f"⑤ 진행여부: {fmt(prog.get('is_done'), '완료', '미완료')}\n"
+        f"⑥ 예배확답: {fmt(prog.get('attend_confirm'))}\n"
+        f"⑦ 진행사항: {fmt(prog.get('note'))}\n"
+        f"⑧ 예배참석: {fmt(prog.get('attendance'))}\n\n"
+        f"<i>수정할 항목을 선택하세요 👇</i>"
+    )
+
+    # 항목별 수정 버튼
+    buttons = [
+        [InlineKeyboardButton("① 심방자 수정",   callback_data="edit_step:shepherd"),
+         InlineKeyboardButton("② 심방날짜 수정", callback_data="edit_step:date")],
+        [InlineKeyboardButton("③ 심방계획 수정", callback_data="edit_step:plan"),
+         InlineKeyboardButton("④ 타겟여부 수정", callback_data="edit_step:target")],
+        [InlineKeyboardButton("⑤ 진행여부 수정", callback_data="edit_step:done"),
+         InlineKeyboardButton("⑥ 예배확답 수정", callback_data="edit_step:worship")],
+        [InlineKeyboardButton("⑦ 진행사항 수정", callback_data="edit_step:note"),
+         InlineKeyboardButton("⑧ 예배참석 수정", callback_data="edit_step:attendance")],
+        [InlineKeyboardButton("🔄 전체 다시 입력", callback_data=f"edit_full:{row_id}")],
+        [InlineKeyboardButton("◀ 메인 메뉴", callback_data="m:home")],
+    ]
+
+    await save_ctx(chat_id, editing_row_id=row_id, editing_step="")
+
+    try:
+        await q.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+    except Exception as e:
+        logger.warning("edit menu HTML 실패: %s", e)
+        plain = (text.replace("<b>","").replace("</b>","")
+                     .replace("<i>","").replace("</i>",""))
+        await q.message.reply_text(plain, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def _on_edit_step(update: Update, chat_id: int, step: str):
+    """개별 항목 수정 시작"""
+    import html as _html
+    q = update.callback_query
+    ctx = await get_ctx(chat_id)
+    if not ctx:
+        await q.message.reply_text("❌ 세션 만료. /menu")
+        return
+    row_id = ctx.get("editing_row_id", "")
+    if not row_id:
+        await q.message.reply_text("❌ 편집 대상이 없습니다. /menu")
+        return
+
+    # 단일 항목만 수정 모드로 설정 ('edit_' 프리픽스로 구분)
+    await save_ctx(chat_id, editing_step=f"edit_{step}", editing_row_id=row_id)
+    # tmp_* 필드에 기존 값들 유지되도록 (이미 _on_abs_select 에서 채움) 확인
+    ctx = await get_ctx(chat_id)
+    tmp_key = f"tmp_{step}"
+    if not ctx.get(tmp_key):
+        # 기존 값 없으면 DB 에서 가져와서 채움
+        week_key = ctx.get("active_week_key", "")
+        prog = await get_progress(week_key, row_id)
+        if prog:
+            key_map = {
+                "shepherd": prog.get("shepherd", ""),
+                "date": prog.get("visit_date_display", ""),
+                "plan": prog.get("plan_text", ""),
+                "target": "타겟" if prog.get("is_target") else ("미타겟" if prog.get("is_target") is False else ""),
+                "done": "완료" if prog.get("is_done") else ("미완료" if prog.get("is_done") is False else ""),
+                "worship": prog.get("attend_confirm", ""),
+                "note": prog.get("note", ""),
+                "attendance": prog.get("attendance", ""),
+            }
+            await save_ctx(chat_id, **{tmp_key: key_map.get(step, "") or ""})
+
+    # 이름 조회
+    rows = await sb_get(
+        f"weekly_visit_targets?select=name&row_id=eq.{quote(row_id)}"
+    )
+    name = rows[0]["name"] if rows else row_id
+    if rows:
+        enriched = await enrich_names(rows)
+        if enriched:
+            name = enriched[0].get("name", name) or name
+
+    label = STEP_LABELS.get(step, step)
+    step_idx = STEPS.index(step) + 1
+
+    if step in STEP_CHOICES:
+        await q.message.reply_text(
+            f"✏️ <b>{_html.escape(str(name))}</b> 님 — <b>{_html.escape(label)}</b>\n"
+            f"{step_idx}번 항목만 수정합니다.\n\n"
+            f"아래에서 선택하세요:",
+            parse_mode="HTML",
+            reply_markup=_kb_choice(step),
+        )
+    else:
+        await q.message.reply_text(
+            f"✏️ <b>{_html.escape(str(name))}</b> 님 — <b>{_html.escape(label)}</b>\n"
+            f"{step_idx}번 항목만 수정합니다.\n\n"
+            f"새 값을 입력해주세요 (취소: /cancel):",
+            parse_mode="HTML",
+            reply_markup=kb_cancel_only(),
+        )
+
+
+async def _on_edit_full(update: Update, chat_id: int, row_id: str):
+    """전체 다시 입력 — 기존 _on_abs_select 의 순차 입력 로직 실행"""
+    # tmp_* 초기화 후 shepherd 부터 시작
+    await clear_tmp(chat_id)
+    await save_ctx(chat_id, editing_row_id=row_id, editing_step="shepherd")
+
+    import html as _html
+    q = update.callback_query
+    rows = await sb_get(
+        f"weekly_visit_targets?select=name&row_id=eq.{quote(row_id)}"
+    )
+    name = rows[0]["name"] if rows else row_id
+    if rows:
+        enriched = await enrich_names(rows)
+        if enriched:
+            name = enriched[0].get("name", name) or name
 
     try:
         await q.message.reply_text(
-            f"✏️ <b>{_html.escape(str(name))}</b> 님 심방 기록 시작{existing}\n\n"
+            f"🔄 <b>{_html.escape(str(name))}</b> 님 심방 기록 — 전체 다시 입력\n\n"
             f"1️⃣ {_html.escape(STEP_LABELS['shepherd'])}\n입력해주세요:\n\n"
             f"<i>중단하려면 ❌ 취소 버튼 또는 /cancel</i>",
             parse_mode="HTML",
             reply_markup=kb_cancel_only(),
         )
-    except Exception as e:
-        logger.warning("HTML parse 실패, 평문으로 전송: %s", e)
+    except Exception:
         await q.message.reply_text(
-            f"✏️ {name} 님 심방 기록 시작\n\n"
+            f"🔄 {name} 님 심방 기록 — 전체 다시 입력\n\n"
             f"1️⃣ {STEP_LABELS['shepherd']}\n입력해주세요:",
             reply_markup=kb_cancel_only(),
         )
@@ -2034,6 +2320,17 @@ async def _on_choice(update: Update, chat_id: int, step: str, value: str):
     tmp_key = f"tmp_{step}"
     await save_ctx(chat_id, **{tmp_key: value})
     ctx = await get_ctx(chat_id)
+
+    # 🔧 단일 편집 모드 체크
+    current_editing = ctx.get("editing_step", "") or ""
+    if current_editing == f"edit_{step}":
+        # 단일 편집 → DB 바로 저장 + 메뉴 복귀
+        class FakeUpd:
+            message = q.message
+            effective_chat = update.effective_chat
+        await _save_single_edit_and_show_menu(FakeUpd(), chat_id)
+        return
+
     step_idx = STEPS.index(step)
 
     class FakeUpd:
@@ -2423,6 +2720,7 @@ async def _on_sp_toggle(update: Update, chat_id: int, church: str, dept: str, na
 
 
 async def _on_sp_edit_text(update: Update, chat_id: int, church: str, dept: str, name: str, phone: str, which: str):
+    import html as _html
     q = update.callback_query
     step = "awaiting_sp3" if which == "3" else "awaiting_sp4"
     await save_ctx(chat_id,
@@ -2431,14 +2729,22 @@ async def _on_sp_edit_text(update: Update, chat_id: int, church: str, dept: str,
         editing_step=step,
     )
     label = "금주 심방예정일" if which == "3" else "금주 심방계획"
-    await q.message.reply_text(
-        f"✏️ *{md(name)}* 님의 *{label}* 을 입력해주세요:\n\n"
-        f"_취소하려면 /cancel_",
-        parse_mode="Markdown",
-    )
+    try:
+        await q.message.reply_text(
+            f"✏️ <b>{_html.escape(str(name))}</b> 님의 <b>{label}</b> 을 입력해주세요:\n\n"
+            f"<i>취소하려면 /cancel</i>",
+            parse_mode="HTML",
+            reply_markup=kb_cancel_only(),
+        )
+    except Exception:
+        await q.message.reply_text(
+            f"✏️ {name} 님의 {label} 을 입력해주세요:\n\n취소하려면 /cancel",
+            reply_markup=kb_cancel_only(),
+        )
 
 
 async def _on_sp_unregister(update: Update, chat_id: int, church: str, dept: str, name: str, phone: str):
+    import html as _html
     try:
         await sb_rpc("unregister_special_management", {
             "p_dept": dept, "p_name": name, "p_phone_last4": phone
@@ -2447,11 +2753,17 @@ async def _on_sp_unregister(update: Update, chat_id: int, church: str, dept: str
         await update.callback_query.message.reply_text(f"❌ 해제 실패: {e}")
         return
     q = update.callback_query
-    await q.edit_message_text(
-        f"🗑 *{md(name)}* 님을 특별관리에서 해제했습니다.",
-        parse_mode="Markdown",
-        reply_markup=kb_main_menu(is_private_chat(update)),
-    )
+    try:
+        await q.edit_message_text(
+            f"🗑 <b>{_html.escape(str(name))}</b> 님을 특별관리에서 해제했습니다.",
+            parse_mode="HTML",
+            reply_markup=kb_main_menu(is_private_chat(update)),
+        )
+    except Exception:
+        await q.edit_message_text(
+            f"🗑 {name} 님을 특별관리에서 해제했습니다.",
+            reply_markup=kb_main_menu(is_private_chat(update)),
+        )
 
 
 # ── row_id 기반 / 컨텍스트 기반 래퍼 (callback_data 64 byte 한도 대응) ────
