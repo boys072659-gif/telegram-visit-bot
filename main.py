@@ -74,7 +74,7 @@ STEP_CHOICES = {
 }
 
 # ── 특별관리 4항목 ─────────────────────────────────────────────────────────────
-# 1번: 최초 1회만 · 2/3/4번: 매주 화요일 19시 초기화
+# 1번: 최초 1회만 · 2/3/4번: 매주 목요일 07시 초기화
 SP_ITEM_LABELS = {
     "item1_chat_invited":  "대책방 초대완료 (구역장·인섬교·강사·전도사·심방부사명자)",
     "item2_feedback_done": "금주 피드백 진행",
@@ -618,7 +618,7 @@ HELP_TEXT = (
     "   ② 금주 피드백 진행 (주간 리셋)\n"
     "   ③ 금주 심방예정일\n"
     "   ④ 금주 심방계획\n"
-    f"매주 화요일 {WEEKLY_REMINDER_HOUR:02d}:{WEEKLY_REMINDER_MIN:02d} KST 에 미체크 항목 리마인더 발송\n\n"
+    f"매주 목요일 07:00 KST 에 미체크 항목 리마인더 발송\n\n"
 
     "*4️⃣ 미니앱 (개인 채팅에서만)*\n"
     "`📝 결석자 심방 기록 (폼)` 버튼 탭\n"
@@ -626,11 +626,16 @@ HELP_TEXT = (
     "→ 기존 심방 기록 자동 로드 → 보충/수정 후 저장\n"
     "⚠️ 그룹방에서는 미니앱 버튼 안 보임 (텔레그램 정책)\n\n"
 
+    "*📅 자동 알림 스케줄*\n"
+    "• *수요일 07:00 KST* → 모든 방에 이번 주 결석자 심방계획 요청\n"
+    "• *목요일 07:00 KST* → 특별관리 대상 미체크 항목 리마인더 (연속결석자 방)\n\n"
+
     "*5️⃣ 명령어 모음*\n"
     "• `/start` — 방 설정 + 메인 메뉴\n"
     "• `/menu` — 메인 메뉴\n"
     "• `/setup` — 방 범위 재설정 (최초 설정자만)\n"
     "• `/myscope` — 이 방의 현재 범위 확인\n"
+    "• `/chatid` — 이 방의 Chat ID 확인 🆕\n"
     "• `/cancel` — 현재 입력 중단\n"
     "• `/help` — 이 사용법\n"
     "• `/diagnose` — DB 진단\n\n"
@@ -665,6 +670,128 @@ async def safe_reply_text(message, text: str, **kwargs):
         raise
 
 
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 🛡 봇 방 승인 체크 (보안 레벨 3)
+# ═════════════════════════════════════════════════════════════════════════════
+async def is_chat_authorized(chat_id: int) -> bool:
+    """이 방이 관리자에 의해 사전 승인된 방인지 확인."""
+    try:
+        result = await sb_rpc("is_chat_authorized", {"p_chat_id": chat_id})
+        if isinstance(result, bool):
+            return result
+        if isinstance(result, list) and len(result) > 0:
+            first = result[0]
+            if isinstance(first, bool): return first
+            if isinstance(first, dict):
+                return bool(first.get("is_chat_authorized", False))
+        return False
+    except Exception as e:
+        logger.warning("is_chat_authorized 실패: %s", e)
+        return False
+
+
+async def record_chat_access(chat_id: int):
+    """승인된 방의 접근 기록 (감사 로그)."""
+    try:
+        await sb_rpc("record_chat_access", {"p_chat_id": chat_id})
+    except Exception as e:
+        logger.warning("record_chat_access 실패: %s", e)
+
+
+def unauthorized_message(chat_id: int, chat_title: str = "") -> str:
+    """미승인 방에 표시할 안내 메시지."""
+    import html as _html
+    return (
+        "🔒 <b>승인되지 않은 방입니다</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"이 방은 관리자에 의해 사전 승인된 방이 아니므로,\n"
+        f"결석자 심방 정보를 볼 수 없습니다.\n\n"
+        f"📋 <b>이 방 정보</b>:\n"
+        f"• Chat ID: <code>{chat_id}</code>\n"
+        f"• 방 이름: {_html.escape(chat_title or '(제목없음)')}\n\n"
+        f"👉 <b>아래 🙏 승인 신청하기 버튼을 누르시면</b>\n"
+        f"관리자에게 자동으로 승인 요청이 전달됩니다."
+    )
+
+
+def kb_request_approval() -> InlineKeyboardMarkup:
+    """승인 신청 버튼 키보드"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🙏 승인 신청하기", callback_data="request_approval")]
+    ])
+
+
+async def is_bot_admin_user(user_id: int) -> bool:
+    """이 user_id 가 봇 관리자인지 확인."""
+    if not user_id:
+        return False
+    try:
+        result = await sb_rpc("is_bot_admin", {"p_user_id": user_id})
+        if isinstance(result, bool):
+            return result
+        if isinstance(result, list) and len(result) > 0:
+            first = result[0]
+            if isinstance(first, bool): return first
+            if isinstance(first, dict):
+                return bool(first.get("is_bot_admin", False))
+        return False
+    except Exception as e:
+        logger.warning("is_bot_admin 실패: %s", e)
+        return False
+
+
+async def get_active_bot_admins() -> list[dict]:
+    """활성 봇 관리자 목록."""
+    try:
+        rows = await sb_rpc("get_active_bot_admins", {})
+        if isinstance(rows, list):
+            return [r for r in rows if isinstance(r, dict)]
+        return []
+    except Exception as e:
+        logger.warning("get_active_bot_admins 실패: %s", e)
+        return []
+
+
+async def ensure_authorized(update: Update) -> bool:
+    """
+    승인 체크 + 미승인 시 안내 메시지 전송.
+    승인되었으면 True, 안 되었으면 False 반환.
+    개인채팅(private)은 항상 승인.
+    """
+    chat = update.effective_chat
+    if not chat:
+        return False
+    # 개인방은 항상 허용
+    if chat.type == "private":
+        return True
+
+    chat_id = chat.id
+    if await is_chat_authorized(chat_id):
+        await record_chat_access(chat_id)
+        return True
+
+    # 미승인 - 안내 메시지 + 승인 신청 버튼
+    chat_title = chat.title or chat.full_name or ""
+    msg = unauthorized_message(chat_id, chat_title)
+    kb = kb_request_approval()
+    try:
+        if update.message:
+            await update.message.reply_text(msg, parse_mode="HTML", reply_markup=kb)
+        elif update.callback_query:
+            await update.callback_query.message.reply_text(msg, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        logger.warning("미승인 메시지 전송 실패: %s", e)
+        try:
+            plain = msg.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
+            if update.message:
+                await update.message.reply_text(plain, reply_markup=kb)
+            elif update.callback_query:
+                await update.callback_query.message.reply_text(plain, reply_markup=kb)
+        except Exception:
+            pass
+    return False
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -765,22 +892,23 @@ def kb_setup_church() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 def kb_setup_dept(church: str) -> InlineKeyboardMarkup:
+    """부서 선택 (지역까지 의무 설정 — 교회 전체 스킵 불가)"""
     rows = [[InlineKeyboardButton(f"🏛 {dp}", callback_data=f"scope_dp:{dp}")] for dp in DEPTS]
-    rows.append([InlineKeyboardButton("⏭ 여기까지만 (교회 전체)", callback_data="scope_stop:church")])
     rows.append([InlineKeyboardButton("◀ 교회 다시 선택", callback_data="scope_setup")])
     rows.append([InlineKeyboardButton("❌ 취소", callback_data="flow_cancel")])
     return InlineKeyboardMarkup(rows)
 
 def kb_setup_region() -> InlineKeyboardMarkup:
+    """지역 입력 단계 (의무) — '여기까지만' 버튼 제거"""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏭ 여기까지만 (부서 전체)", callback_data="scope_stop:dept")],
         [InlineKeyboardButton("◀ 부서 다시 선택", callback_data="scope_setup_back_dept")],
         [InlineKeyboardButton("❌ 취소", callback_data="flow_cancel")],
     ])
 
 def kb_setup_zone() -> InlineKeyboardMarkup:
+    """구역 입력 (선택) — 지역까지만으로도 완료 가능"""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏭ 여기까지만 (지역 전체)", callback_data="scope_stop:region")],
+        [InlineKeyboardButton("⏭ 지역까지만 완료 (구역 없이)", callback_data="scope_stop:region")],
         [InlineKeyboardButton("◀ 지역 다시 입력", callback_data="scope_setup_back_region")],
         [InlineKeyboardButton("❌ 취소", callback_data="flow_cancel")],
     ])
@@ -788,6 +916,10 @@ def kb_setup_zone() -> InlineKeyboardMarkup:
 
 async def setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """방의 담당 범위 설정 시작 (교회부터)."""
+    # 🛡 보안 체크
+    if not await ensure_authorized(update):
+        return
+
     chat_id = update.effective_chat.id
     user = update.effective_user
     # 이미 설정되어 있고 소유자가 다르면 차단
@@ -844,7 +976,8 @@ async def _on_scope_church(update: Update, chat_id: int, church: str):
     await save_ctx(chat_id, church_filter=church, editing_step="awaiting_scope_dept")
     await q.edit_message_text(
         f"✅ *① 교회*: {md(church)}\n\n"
-        f"*② 부서*를 선택하세요 (또는 교회 전체만 보려면 `⏭ 여기까지만`)",
+        f"*② 부서*를 선택하세요 👇\n\n"
+        f"⚠️ _지역까지 설정해야 결석자를 볼 수 있습니다._",
         parse_mode="Markdown",
         reply_markup=kb_setup_dept(church),
     )
@@ -859,18 +992,35 @@ async def _on_scope_dept(update: Update, chat_id: int, dept: str):
     await q.edit_message_text(
         f"✅ *① 교회*: {md(church)}\n"
         f"✅ *② 부서*: {md(dept)}\n\n"
-        f"*③ 지역* 이름을 입력하세요.\n"
+        f"*③ 지역* 이름을 입력하세요. (필수)\n"
         f"예) `강북`, `강남`, `노원`, `성북`, `중랑`, `대학`\n\n"
-        f"💡 부서 전체만 보려면 아래 `⏭ 여기까지만`",
+        f"⚠️ _지역까지는 반드시 설정해야 합니다._\n"
+        f"_구역까지 더 좁히려면 지역 입력 후 다음 화면에서 선택._",
         parse_mode="Markdown",
         reply_markup=kb_setup_region(),
     )
 
 
 async def _on_scope_stop(update: Update, chat_id: int, stop_level: str):
-    """지정 단계에서 범위 설정 완료"""
+    """지정 단계에서 범위 설정 완료 (지역까지 의무)"""
     q = update.callback_query
     user = update.effective_user
+
+    # 🛑 지역까지 의무 설정 — church/dept 스킵 차단
+    if stop_level in ("church", "dept"):
+        await q.edit_message_text(
+            "❌ <b>지역까지 설정해야 합니다</b>\n\n"
+            "결석자 정보 보호를 위해 최소 <b>지역</b> 단위까지\n"
+            "담당 범위를 설정해야 합니다.\n\n"
+            "부서를 선택하고 지역을 입력해주세요.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀ 부서 다시 선택", callback_data="scope_setup_back_dept")],
+                [InlineKeyboardButton("❌ 취소", callback_data="flow_cancel")],
+            ]),
+        )
+        return
+
     ctx = await get_ctx(chat_id)
     church = ctx.get("church_filter")
     dept   = ctx.get("dept_filter") if stop_level in ("dept","region","zone") else None
@@ -879,6 +1029,12 @@ async def _on_scope_stop(update: Update, chat_id: int, stop_level: str):
 
     if not church:
         await q.edit_message_text("❌ 교회 정보가 없습니다. /setup 다시 시작.")
+        return
+    if not dept:
+        await q.edit_message_text("❌ 부서가 설정되지 않았습니다. /setup 다시 시작.")
+        return
+    if not region:
+        await q.edit_message_text("❌ 지역이 설정되지 않았습니다. /setup 다시 시작.")
         return
 
     owner_name = (user.full_name if user else "") or (user.username if user else "")
@@ -894,13 +1050,13 @@ async def _on_scope_stop(update: Update, chat_id: int, stop_level: str):
 
     new_scope = {"church": church, "dept": dept, "region_name": region, "zone_name": zone}
     await q.edit_message_text(
-        f"🎉 *방 범위 설정 완료*\n\n"
-        f"📌 {md(scope_label(new_scope))}\n"
-        f"👤 최초 설정자: *{md(owner_name or '(미기록)')}*\n\n"
-        f"이제 `📋 결석자 심방` 에서 이 범위의 결석자만 표시됩니다.\n"
-        f"범위 확인: `/myscope`\n"
-        f"변경(최초 설정자만): `/setup`",
-        parse_mode="Markdown",
+        f"🎉 <b>방 범위 설정 완료</b>\n\n"
+        f"📌 {_escape_html(scope_label(new_scope))}\n"
+        f"👤 최초 설정자: <b>{_escape_html(owner_name or '(미기록)')}</b>\n\n"
+        f"이제 📋 결석자 심방 에서 이 범위의 결석자만 표시됩니다.\n"
+        f"범위 확인: /myscope\n"
+        f"변경(최초 설정자만): /setup",
+        parse_mode="HTML",
     )
     # 메뉴 다시 표시
     await q.message.reply_text(
@@ -927,9 +1083,9 @@ async def _on_scope_text_input(update: Update, chat_id: int, text: str):
             f"✅ *① 교회*: {md(church)}\n"
             f"✅ *② 부서*: {md(dept)}\n"
             f"✅ *③ 지역*: {md(region)}\n\n"
-            f"*④ 구역* 이름을 입력하세요.\n"
+            f"*④ 구역* 이름을 입력하세요. (선택)\n"
             f"예) `1-1`, `1팀1`, `2-3`\n\n"
-            f"💡 지역 전체만 보려면 아래 `⏭ 여기까지만`",
+            f"💡 지역까지만 완료하려면 아래 `⏭ 지역까지만 완료` 버튼",
             parse_mode="Markdown",
             reply_markup=kb_setup_zone(),
         )
@@ -970,6 +1126,7 @@ async def _on_scope_text_input(update: Update, chat_id: int, text: str):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    chat_title = update.effective_chat.title or update.effective_chat.full_name or ""
     week_key, week_label = await get_active_week()
 
     # 1) 하단에 고정되는 리플라이 키보드
@@ -977,30 +1134,40 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 *결석자 타겟 심방 봇*에 오신 것을 환영합니다\n"
         f"📅 현재 주차: *{md(week_label) if week_label else '미등록'}*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"⌨️ 하단 키보드로 시작하거나, `❓ 사용법` 버튼으로 도움말을 확인하세요 👇",
+        f"⌨️ 하단 키보드로 시작하세요 👇",
         parse_mode="Markdown",
         reply_markup=kb_reply_main(is_private_chat(update)),
     )
 
+    # 🛡 보안 체크 (그룹방만) — 승인되지 않은 방은 안내 메시지
+    is_private = is_private_chat(update)
+    if not is_private:
+        authorized = await is_chat_authorized(chat_id)
+        if not authorized:
+            await update.message.reply_text(
+                unauthorized_message(chat_id, chat_title),
+                parse_mode="HTML",
+                reply_markup=kb_request_approval(),
+            )
+            return
+        await record_chat_access(chat_id)
+
     # 2) 방 scope 확인 — 미설정이면 setup 유도
     scope = await get_chat_scope(chat_id)
     if not scope:
-        # 개인채팅이 아닌 그룹/채널에서만 scope 필요
-        if is_private_chat(update):
-            # 개인방은 scope 불필요
+        if is_private:
             await update.message.reply_text(
                 "🏠 *메인 메뉴*",
                 parse_mode="Markdown",
-                reply_markup=kb_main_menu(is_private_chat(update)),
+                reply_markup=kb_main_menu(is_private),
             )
         else:
-            # 그룹방: scope 설정 유도
             await update.message.reply_text(
-                f"📌 *이 방은 아직 담당 범위가 설정되지 않았습니다.*\n\n"
+                f"✅ 이 방은 승인되었습니다.\n\n"
+                f"📌 *담당 범위 설정이 필요합니다.*\n\n"
                 f"이 방에서 관리할 *교회 / 부서 / 지역 / 구역*을 설정해야\n"
                 f"결석자 목록이 해당 범위로 자동 필터링됩니다.\n\n"
-                f"아래 `🔧 방 범위 설정` 버튼을 눌러 시작하세요 👇\n"
-                f"💡 교회까지만 설정하면 교회 전체 결석자를 볼 수 있습니다.",
+                f"아래 `🔧 방 범위 설정` 버튼을 눌러 시작하세요 👇",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔧 방 범위 설정", callback_data="scope_setup")],
@@ -1008,12 +1175,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]),
             )
     else:
-        # 이미 설정됨 - 현재 범위 안내 + 메인 메뉴
         await update.message.reply_text(
             f"📌 *이 방의 담당 범위*: {md(scope_label(scope))}\n\n"
             f"🏠 *메인 메뉴*",
             parse_mode="Markdown",
-            reply_markup=kb_main_menu(is_private_chat(update)),
+            reply_markup=kb_main_menu(is_private),
         )
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1107,9 +1273,21 @@ async def diagnose_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═════════════════════════════════════════════════════════════════════════════
 async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     data = q.data
     chat_id = update.effective_chat.id
+
+    # 🆕 승인 관련 콜백은 먼저 체크 (ensure_authorized 전에)
+    if data == "request_approval":
+        await request_approval_callback(update, context)
+        return
+    if data.startswith("admin_approve:"):
+        await admin_approve_callback(update, context)
+        return
+    if data.startswith("admin_deny:"):
+        await admin_deny_callback(update, context)
+        return
+
+    await q.answer()
 
     try:
         # ── 메인 메뉴 ──
@@ -1245,6 +1423,10 @@ async def _show_home(update: Update):
 
 async def _show_church_select(update: Update, flow: str):
     """scope 기반 자동 점프. scope 없으면 교회 선택, 있으면 자동 진행."""
+    # 🛡 보안 체크 (레벨 3): 승인된 방만 접근 허용
+    if not await ensure_authorized(update):
+        return
+
     q = update.callback_query
     chat_id = update.effective_chat.id
     scope = await get_chat_scope(chat_id)
@@ -1278,6 +1460,10 @@ async def _show_church_select(update: Update, flow: str):
 
 async def _show_church_menu(update: Update, flow: str):
     """리플라이 키보드에서 진입할 때 — scope 자동 반영"""
+    # 🛡 보안 체크
+    if not await ensure_authorized(update):
+        return
+
     chat_id = update.effective_chat.id
     scope = await get_chat_scope(chat_id)
 
@@ -1662,6 +1848,99 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3) 일반 심방 입력 단계
     if step in STEPS:
+        # 🛡 검증 1: 리플라이 키보드 라벨이면 "입력 안 함"으로 간주하고 에러 안내
+        RESERVED_LABELS = {
+            "📋 결석자 심방", "🚨 특별관리결석자", "❓ 사용법",
+            "🏠 메인 메뉴", "📝 결석자 심방 기록 (폼)",
+        }
+        if text in RESERVED_LABELS:
+            await update.message.reply_text(
+                f"⚠️ 아직 *{md(STEP_LABELS[step])}* 를 입력하지 않으셨습니다.\n\n"
+                f"현재 단계 입력을 먼저 완료해주세요.\n"
+                f"중단하려면 ❌ 취소 버튼 또는 `/cancel`",
+                parse_mode="Markdown",
+                reply_markup=kb_cancel_only(),
+            )
+            return
+
+        # 🛡 검증 2: 선택형 단계 (target/done/worship/attendance) 는 반드시 버튼으로만
+        if step in STEP_CHOICES:
+            valid_choices = []
+            for row in STEP_CHOICES[step]:
+                valid_choices.extend(row)
+            if text not in valid_choices:
+                rows = STEP_CHOICES[step]
+                keyboard = [
+                    [InlineKeyboardButton(c, callback_data=f"choice:{step}:{c}") for c in row]
+                    for row in rows
+                ]
+                keyboard.append([InlineKeyboardButton("❌ 취소", callback_data="flow_cancel")])
+                await update.message.reply_text(
+                    f"⚠️ *{md(STEP_LABELS[step])}* 는 *아래 버튼 중 하나*를 선택해주세요.\n\n"
+                    f"직접 입력된 값: `{md(text)}`\n"
+                    f"허용 값: {', '.join(f'`{c}`' for c in valid_choices)}",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+                return
+
+        # 🛡 검증 3: 심방자 이름 형식 (너무 짧거나 이상한 값 거부)
+        if step == "shepherd":
+            if len(text) < 2:
+                await update.message.reply_text(
+                    f"⚠️ *심방자 이름*이 너무 짧습니다.\n\n"
+                    f"예: `홍길동(집사)`, `김영희/구역장`, `박철수 목사`\n"
+                    f"다시 입력해주세요:",
+                    parse_mode="Markdown",
+                    reply_markup=kb_cancel_only(),
+                )
+                return
+
+        # 🛡 검증 4: 날짜 형식 (4/27, 2026-04-27, 4.27 등 허용)
+        if step == "date":
+            import re as _re
+            patterns = [
+                r"^\d{1,2}[/.\-]\d{1,2}$",             # 4/27, 4.27, 4-27
+                r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$",     # 2026-04-27
+                r"^\d{1,2}월\s*\d{1,2}일$",             # 4월 27일
+            ]
+            if not any(_re.match(p, text) for p in patterns):
+                await update.message.reply_text(
+                    f"⚠️ *심방날짜 형식*이 올바르지 않습니다.\n\n"
+                    f"허용되는 형식:\n"
+                    f"• `4/27` 또는 `4.27`\n"
+                    f"• `2026-04-27`\n"
+                    f"• `4월 27일`\n\n"
+                    f"입력된 값: `{md(text)}`\n"
+                    f"다시 입력해주세요:",
+                    parse_mode="Markdown",
+                    reply_markup=kb_cancel_only(),
+                )
+                return
+
+        # 🛡 검증 5: 심방계획·진행사항은 너무 짧으면 거부 ("없음" 은 예외)
+        if step == "plan":
+            if len(text) < 3:
+                await update.message.reply_text(
+                    f"⚠️ *심방계획*이 너무 짧습니다 (3자 이상).\n\n"
+                    f"예: `생일축하 겸 안부 방문`, `카페에서 말씀 나눔`\n"
+                    f"다시 입력해주세요:",
+                    parse_mode="Markdown",
+                    reply_markup=kb_cancel_only(),
+                )
+                return
+        if step == "note":
+            if len(text) < 2 and text != "없음" and text != "-":
+                await update.message.reply_text(
+                    f"⚠️ *진행사항*이 너무 짧습니다.\n\n"
+                    f"내용이 없으면 `없음` 이라고 입력해주세요.\n"
+                    f"다시 입력해주세요:",
+                    parse_mode="Markdown",
+                    reply_markup=kb_cancel_only(),
+                )
+                return
+
+        # ✅ 검증 통과 - 저장 후 다음 단계
         tmp_key = f"tmp_{step}"
         await save_ctx(chat_id, **{tmp_key: text})
         step_idx = STEPS.index(step)
@@ -1761,31 +2040,46 @@ async def _next_step(update, chat_id: int, current_idx: int, ctx: dict):
 
 
 async def _show_confirm(update, chat_id: int, ctx: dict):
+    import html as _html
     row_id = ctx.get("editing_row_id", "")
     rows = await sb_get(f"weekly_visit_targets?select=name&row_id=eq.{quote(row_id)}")
-    name = rows[0]["name"] if rows else row_id
+    if rows:
+        enriched = await enrich_names(rows)
+        name = enriched[0]["name"] if enriched else row_id
+    else:
+        name = row_id
+
+    def _e(v):
+        return _html.escape(str(v)) if v else "-"
 
     summary = (
-        f"📋 *심방 기록 확인* — {md(name)}\n\n"
-        f"심방자: {md(ctx.get('tmp_shepherd','') or '-')}\n"
-        f"심방날짜: {md(ctx.get('tmp_date','') or '-')}\n"
-        f"심방계획: {md(ctx.get('tmp_plan','') or '-')}\n"
-        f"타겟여부: {md(ctx.get('tmp_target','') or '-')}\n"
-        f"진행여부: {md(ctx.get('tmp_done','') or '-')}\n"
-        f"예배확답: {md(ctx.get('tmp_worship','') or '-')}\n"
-        f"진행사항: {md(ctx.get('tmp_note','') or '-')}\n"
-        f"예배참석: {md(ctx.get('tmp_attendance','') or '-')}\n\n"
+        f"📋 <b>심방 기록 확인</b> — {_e(name)}\n\n"
+        f"심방자: {_e(ctx.get('tmp_shepherd',''))}\n"
+        f"심방날짜: {_e(ctx.get('tmp_date',''))}\n"
+        f"심방계획: {_e(ctx.get('tmp_plan',''))}\n"
+        f"타겟여부: {_e(ctx.get('tmp_target',''))}\n"
+        f"진행여부: {_e(ctx.get('tmp_done',''))}\n"
+        f"예배확답: {_e(ctx.get('tmp_worship',''))}\n"
+        f"진행사항: {_e(ctx.get('tmp_note',''))}\n"
+        f"예배참석: {_e(ctx.get('tmp_attendance',''))}\n\n"
         f"저장하시겠습니까?"
     )
     buttons = [[
         InlineKeyboardButton("✅ 저장", callback_data="confirm_save"),
         InlineKeyboardButton("❌ 취소", callback_data="cancel_save"),
     ]]
-    await update.message.reply_text(summary, parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons))
+    try:
+        await update.message.reply_text(summary, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons))
+    except Exception as e:
+        logger.warning("HTML confirm 전송 실패, 평문으로 재시도: %s", e)
+        plain_msg = (summary.replace("<b>","").replace("</b>",""))
+        await update.message.reply_text(plain_msg,
+            reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def _do_save(update: Update, chat_id: int):
+    import html as _html
     q = update.callback_query
     ctx = await get_ctx(chat_id)
     if not ctx:
@@ -1800,32 +2094,54 @@ async def _do_save(update: Update, chat_id: int):
         await upsert_progress(week_key, row_id, ctx)
         await clear_tmp(chat_id)
         rows = await sb_get(f"weekly_visit_targets?select=name&row_id=eq.{quote(row_id)}")
-        name = rows[0]["name"] if rows else row_id
-        await q.message.reply_text(
-            f"✅ *{md(name)}* 님 심방 기록 저장 완료!\n\n"
-            f"계속하려면 /menu",
-            parse_mode="Markdown",
-        )
+        if rows:
+            enriched = await enrich_names(rows)
+            name = enriched[0]["name"] if enriched else row_id
+        else:
+            name = row_id
+        try:
+            await q.message.reply_text(
+                f"✅ <b>{_html.escape(str(name))}</b> 님 심방 기록 저장 완료!\n\n"
+                f"계속하려면 /menu",
+                parse_mode="HTML",
+            )
+        except Exception as pe:
+            logger.warning("HTML 완료 메시지 실패, 평문으로: %s", pe)
+            await q.message.reply_text(
+                f"✅ {name} 님 심방 기록 저장 완료!\n\n계속하려면 /menu"
+            )
     except Exception as e:
         logger.exception(e)
-        await q.message.reply_text(f"❌ 저장 실패: {e}")
+        # 에러 메시지도 평문으로 (특수문자 포함 가능)
+        try:
+            err_txt = str(e)[:200]  # 너무 긴 에러 잘라내기
+            await q.message.reply_text(f"❌ 저장 실패: {err_txt}")
+        except Exception:
+            await q.message.reply_text("❌ 저장 실패 (알 수 없는 오류)")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 특별관리 흐름
 # ═════════════════════════════════════════════════════════════════════════════
 async def _on_sp_church(update: Update, chat_id: int, church: str):
+    import html as _html
     q = update.callback_query
     await save_ctx(chat_id, church_filter=church)
     txt = (
-        f"🚨 *특별관리결석자*\n\n"
-        f"✅ 교회: *{md(church)}*\n\n"
-        f"② *부서* 를 선택하세요 👇"
+        f"🚨 <b>특별관리결석자</b>\n\n"
+        f"✅ 교회: <b>{_html.escape(church)}</b>\n\n"
+        f"② <b>부서</b> 를 선택하세요 👇"
     )
-    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb_dept_select("sp", church))
+    try:
+        await q.edit_message_text(txt, parse_mode="HTML", reply_markup=kb_dept_select("sp", church))
+    except Exception as e:
+        logger.warning("sp_church edit 실패: %s", e)
+        await q.message.reply_text(txt.replace("<b>","").replace("</b>",""),
+                                   reply_markup=kb_dept_select("sp", church))
 
 
 async def _on_sp_dept(update: Update, chat_id: int, church: str, dept: str):
+    import html as _html
     q = update.callback_query
     week_key, week_label = await get_active_week()
     if not week_key:
@@ -1833,11 +2149,13 @@ async def _on_sp_dept(update: Update, chat_id: int, church: str, dept: str):
         return
 
     targets = await fetch_absentees_4plus(week_key, church, dept)
+    # 이름 마스킹 복구
+    targets = await enrich_names(targets)
     if not targets:
         await q.edit_message_text(
-            f"📭 *{md(church)} / {md(dept)}* 의 연속결석 4회 이상 결석자가 없습니다.\n"
-            f"(주차: `{md(week_label)}`)",
-            parse_mode="Markdown",
+            f"📭 <b>{_html.escape(church)} / {_html.escape(dept)}</b> 의 연속결석 4회 이상 결석자가 없습니다.\n"
+            f"(주차: {_html.escape(week_label or week_key)})",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("◀ 부서 다시 선택", callback_data=f"sp_ch:{church}")],
                 [InlineKeyboardButton("◀ 메인 메뉴",       callback_data="m:home")],
@@ -1870,10 +2188,8 @@ async def _on_sp_dept(update: Update, chat_id: int, church: str, dept: str):
         is_reg = (name, phone) in registered_set
         mark = "🚨" if is_reg else "⚠️"
         label = f"{mark} {name} ({region} {zone}) · {streak}회"
-        # 버튼 텍스트는 64자 제한 (Telegram button label)
         if len(label) > 60:
             label = label[:57] + "..."
-        # callback_data는 64 byte 제한 — row_id만 전달 (나중에 DB에서 조회)
         buttons.append([InlineKeyboardButton(
             label,
             callback_data=f"sp_pk:{row_id}"
@@ -1881,31 +2197,41 @@ async def _on_sp_dept(update: Update, chat_id: int, church: str, dept: str):
     buttons.append([InlineKeyboardButton("◀ 부서 다시 선택", callback_data=f"sp_ch:{church}")])
     buttons.append([InlineKeyboardButton("◀ 메인 메뉴",       callback_data="m:home")])
 
-    overflow_note = f"\n\n_(+ {overflow}명은 화면 제한으로 생략 — 연속결석 순 상위 {MAX_TARGETS}명만 표시)_" if overflow > 0 else ""
+    overflow_note = f"\n\n<i>(+ {overflow}명은 화면 제한으로 생략 — 연속결석 순 상위 {MAX_TARGETS}명만 표시)</i>" if overflow > 0 else ""
     txt = (
-        f"🚨 *{md(church)} / {md(dept)}* — 4회 이상 {len(targets)}명\n"
-        f"주차: `{md(week_label)}`\n\n"
+        f"🚨 <b>{_html.escape(church)} / {_html.escape(dept)}</b> — 4회 이상 {len(targets)}명\n"
+        f"주차: {_html.escape(week_label or week_key)}\n\n"
         f"🚨 = 특별관리 등록됨 (방 감지중)\n"
         f"⚠️ = 아직 미등록\n\n"
         f"관리할 결석자를 선택하세요 👇\n"
-        f"_(선택 시 이 방이 감지방으로 등록됩니다)_"
+        f"<i>(선택 시 이 방이 감지방으로 등록됩니다)</i>"
         f"{overflow_note}"
     )
-    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+    try:
+        await q.edit_message_text(txt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+    except Exception as e:
+        logger.warning("sp_dept edit 실패: %s", e)
+        plain = txt.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","")
+        await q.message.reply_text(plain, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def _on_sp_pick(update: Update, chat_id: int, church: str, dept: str, name: str, phone: str):
     """특별관리 대상 선택 → 방 감지 등록 + 상세 화면"""
+    import html as _html
     q = update.callback_query
     chat = update.effective_chat
 
-    # 결석자 정보
+    # 결석자 정보 (이름 마스킹 복구)
     rows = await sb_get(
-        f"weekly_visit_targets?select=region_name,zone_name"
+        f"weekly_visit_targets?select=name,region_name,zone_name,church,dept,phone_last4"
         f"&dept=eq.{quote(dept)}&name=eq.{quote(name)}"
         + (f"&phone_last4=eq.{quote(phone)}" if phone else "")
         + "&limit=1"
     )
+    if rows:
+        enriched = await enrich_names(rows)
+        if enriched:
+            name = enriched[0].get("name", name) or name
     region = rows[0].get("region_name","") if rows else ""
     zone   = rows[0].get("zone_name","")   if rows else ""
 
@@ -1925,13 +2251,22 @@ async def _on_sp_pick(update: Update, chat_id: int, church: str, dept: str, name
         await q.message.reply_text(f"❌ 등록 실패: {e}")
         return
 
-    await q.edit_message_text(
-        f"✅ *{md(name)}* 님을 *특별관리 대상*으로 등록했습니다.\n"
-        f"이 방에서 감지를 시작합니다.\n\n"
-        f"매주 화요일 {WEEKLY_REMINDER_HOUR:02d}:{WEEKLY_REMINDER_MIN:02d} KST 에 "
-        f"미체크 항목 리마인더가 이 방으로 발송됩니다.",
-        parse_mode="Markdown",
-    )
+    try:
+        await q.edit_message_text(
+            f"✅ <b>{_html.escape(str(name))}</b> 님을 <b>특별관리 대상</b>으로 등록했습니다.\n"
+            f"이 방에서 감지를 시작합니다.\n\n"
+            f"매주 목요일 07:00 KST 에 "
+            f"미체크 항목 리마인더가 이 방으로 발송됩니다.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning("sp_pick edit 실패: %s", e)
+        await q.message.reply_text(
+            f"✅ {name} 님을 특별관리 대상으로 등록했습니다.\n"
+            f"이 방에서 감지를 시작합니다.\n"
+            f"매주 목요일 07:00 KST 에 리마인더가 발송됩니다."
+        )
+
     await save_ctx(
         chat_id,
         church_filter=church,
@@ -1943,7 +2278,8 @@ async def _on_sp_pick(update: Update, chat_id: int, church: str, dept: str, name
 
 
 async def _show_sp_detail(update, chat_id: int, church: str, dept: str, name: str, phone: str, send_new: bool = False):
-    """특별관리 대상 상세 + 4항목 체크리스트"""
+    """특별관리 대상 상세 + 4항목 체크리스트 (HTML parse_mode)"""
+    import html as _html
     try:
         detail = await sb_rpc("get_special_detail", {
             "p_dept": dept, "p_name": name, "p_phone_last4": phone
@@ -1971,19 +2307,18 @@ async def _show_sp_detail(update, chat_id: int, church: str, dept: str, name: st
     item4 = d.get("item4_visit_plan") or ""
 
     text = (
-        f"🚨 *특별관리: {md(name)}*\n"
-        f"{md(church)} / {md(dept)} / {md(region)} {md(zone)}\n"
+        f"🚨 <b>특별관리: {_html.escape(str(name))}</b>\n"
+        f"{_html.escape(church)} / {_html.escape(dept)} / {_html.escape(region)} {_html.escape(zone)}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{'✅' if item1 else '⬜️'} *1. 대책방 초대완료*\n"
+        f"{'✅' if item1 else '⬜️'} <b>1. 대책방 초대완료</b>\n"
         f"   (구역장·인섬교·강사·전도사·심방부사명자)\n"
-        f"   _최초 1회만 체크 (주간 리셋 안 됨)_\n\n"
-        f"{'✅' if item2 else '⬜️'} *2. 금주 피드백 진행*\n"
-        f"   _매주 화요일 19시 초기화_\n\n"
-        f"📅 *3. 금주 심방예정일:* {md(item3) if item3 else '_미입력_'}\n\n"
-        f"📝 *4. 금주 심방계획:* {md(item4) if item4 else '_미입력_'}"
+        f"   <i>최초 1회만 체크 (주간 리셋 안 됨)</i>\n\n"
+        f"{'✅' if item2 else '⬜️'} <b>2. 금주 피드백 진행</b>\n"
+        f"   <i>매주 목요일 07시 초기화</i>\n\n"
+        f"📅 <b>3. 금주 심방예정일:</b> {_html.escape(str(item3)) if item3 else '<i>미입력</i>'}\n\n"
+        f"📝 <b>4. 금주 심방계획:</b> {_html.escape(str(item4)) if item4 else '<i>미입력</i>'}"
     )
 
-    # callback_data는 64 byte 제한 — 짧은 명령만, 실제 대상은 ctx에서 읽음
     buttons = [
         [InlineKeyboardButton(
             f"{'✅ 1번 체크됨 (탭:해제)' if item1 else '⬜️ 1번 체크 (대책방 초대완료)'}",
@@ -2003,19 +2338,35 @@ async def _show_sp_detail(update, chat_id: int, church: str, dept: str, name: st
     ]
     kb = InlineKeyboardMarkup(buttons)
 
+    async def _send_with_fallback(send_fn_html, send_fn_plain):
+        try:
+            await send_fn_html()
+        except Exception as e:
+            logger.warning("sp_detail HTML 실패, 평문으로: %s", e)
+            try:
+                await send_fn_plain()
+            except Exception as e2:
+                logger.exception("sp_detail 평문도 실패: %s", e2)
+
+    plain_text = (text.replace("<b>","").replace("</b>","")
+                      .replace("<i>","").replace("</i>",""))
+
     if send_new:
         target = update.message if hasattr(update, 'message') and update.message else (
             update.callback_query.message if update.callback_query else None
         )
         if target:
-            await target.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+            await _send_with_fallback(
+                lambda: target.reply_text(text, parse_mode="HTML", reply_markup=kb),
+                lambda: target.reply_text(plain_text, reply_markup=kb),
+            )
     else:
         q = update.callback_query
         if q:
-            try:
-                await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
-            except Exception:
-                await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+            await _send_with_fallback(
+                lambda: q.edit_message_text(text, parse_mode="HTML", reply_markup=kb),
+                lambda: q.message.reply_text(plain_text, reply_markup=kb),
+            )
 
 
 async def _on_sp_toggle(update: Update, chat_id: int, church: str, dept: str, name: str, phone: str, which: str):
@@ -2130,7 +2481,7 @@ async def _on_sp_unregister_ctx(update: Update, chat_id: int):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 매주 화요일 19시 KST — 주간 리마인더 + 2/3/4번 리셋
+# 매주 목요일 07시 KST — 주간 리마인더 + 2/3/4번 리셋
 # ═════════════════════════════════════════════════════════════════════════════
 async def weekly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info("🔔 weekly_reminder_job start")
@@ -2162,7 +2513,7 @@ async def weekly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
 
             if unchecked:
                 msg = (
-                    f"🔔 *주간 리마인더* (화요일 {WEEKLY_REMINDER_HOUR}시)\n"
+                    f"🔔 *주간 리마인더* (목요일 07시)\n"
                     f"👤 *{md(name)}* ({md(dept)} / {md(region)} {md(zone)})\n\n"
                     f"미체크 항목:\n" + "\n".join(unchecked) +
                     f"\n\n/menu → 🚨 특별관리결석자 에서 업데이트하세요."
@@ -2201,6 +2552,460 @@ async def force_weekly_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 🆕 매주 수요일 07시 KST — 모든 봇 방에 타겟 결석자 심방계획 요청
+# ═════════════════════════════════════════════════════════════════════════════
+async def wednesday_visit_plan_request_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    매주 수요일 07시 KST에 실행.
+    봇이 등록된 모든 방(telegram_chat_scope) 에 현재 주차 결석자 요약 + 심방계획 요청.
+    """
+    logger.info("📅 wednesday_visit_plan_request_job start")
+    try:
+        # 1) 현재 주차
+        week_key, week_label = await get_active_week()
+        if not week_key:
+            logger.warning("활성 주차 없음, 수요일 알림 스킵")
+            return
+
+        # 2) 봇이 등록된 모든 방 목록
+        try:
+            scopes = await sb_get(
+                "telegram_chat_scope?select=chat_id,chat_title,church,dept,region_name,zone_name&limit=2000"
+            ) or []
+        except Exception as e:
+            logger.exception("scope 목록 로드 실패: %s", e)
+            return
+
+        if not scopes:
+            logger.info("등록된 방이 없음")
+            return
+
+        logger.info("수요일 알림 대상 방: %d개", len(scopes))
+        sent = 0
+        failed = 0
+
+        for s in scopes:
+            chat_id = s.get("chat_id")
+            if not chat_id:
+                continue
+
+            # 🛡 승인된 방만 알림 발송
+            if not await is_chat_authorized(chat_id):
+                logger.info("수요일 알림 스킵 (미승인 방): %s", chat_id)
+                continue
+
+            church = s.get("church", "")
+            dept   = s.get("dept", "")
+            region = s.get("region_name", "")
+            zone   = s.get("zone_name", "")
+
+            if not church:
+                continue  # 교회 없는 방은 스킵
+
+            # 3) 이 방의 범위에 맞는 결석자 조회
+            try:
+                path = (
+                    f"weekly_visit_targets"
+                    f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
+                    f"&week_key=eq.{quote(week_key)}"
+                    f"&church=eq.{quote(church)}"
+                )
+                if dept:   path += f"&dept=eq.{quote(dept)}"
+                if region: path += f"&region_name=eq.{quote(region)}"
+                if zone:   path += f"&zone_name=eq.{quote(normalize_zone(zone))}"
+                path += "&order=consecutive_absent_count.desc,name.asc&limit=500"
+
+                rows = await sb_get(path) or []
+                rows = await enrich_names(rows)
+
+                # 이 방 범위의 결석자 중 타겟만 뽑기 (weekly_visit_progress.is_target=true)
+                # 진행도 확인 (타겟 지정 여부, 심방계획 입력 여부)
+                target_summary = {"total": 0, "with_plan": 0, "target_set": 0}
+                if rows:
+                    row_ids = [r.get("row_id") for r in rows if r.get("row_id")]
+                    try:
+                        in_list = ",".join([quote(x) for x in row_ids])
+                        prog_rows = await sb_get(
+                            f"weekly_visit_progress?select=row_id,is_target,plan_text"
+                            f"&week_key=eq.{quote(week_key)}&row_id=in.({in_list})&limit=500"
+                        ) or []
+                        prog_map = {p["row_id"]: p for p in prog_rows}
+                        target_summary["total"] = len(rows)
+                        for r in rows:
+                            p = prog_map.get(r.get("row_id"))
+                            if p:
+                                if p.get("is_target"): target_summary["target_set"] += 1
+                                if p.get("plan_text", ""): target_summary["with_plan"] += 1
+                    except Exception as pe:
+                        logger.warning("progress 조회 실패 (chat_id=%s): %s", chat_id, pe)
+
+                # 4) 메시지 구성 (HTML parse_mode - Markdown 특수문자 파싱 에러 방지)
+                import html as _html
+                scope_txt = " / ".join([x for x in [church, dept, region, zone] if x])
+                week_label_safe = _html.escape(week_label or week_key)
+
+                if not rows:
+                    msg = (
+                        f"📋 <b>수요일 심방계획 요청</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"📌 담당: <b>{_html.escape(scope_txt)}</b>\n"
+                        f"📅 주차: <b>{week_label_safe}</b>\n\n"
+                        f"✅ 이번 주 해당 범위 결석자 없습니다. 수고하셨습니다!"
+                    )
+                else:
+                    # 샘플 이름 몇 개 보여주기
+                    sample_names = []
+                    for r in rows[:10]:
+                        nm = r.get("name", "?")
+                        streak = r.get("consecutive_absent_count", 0) or 0
+                        zn = r.get("zone_name", "") or ""
+                        sample_names.append(
+                            f"• {_html.escape(nm)} {_html.escape(zn)} · 연속{streak}회"
+                        )
+                    more_line = f"\n... 외 {len(rows) - 10}명" if len(rows) > 10 else ""
+
+                    msg = (
+                        f"📋 <b>수요일 심방계획 요청</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"📌 담당: <b>{_html.escape(scope_txt)}</b>\n"
+                        f"📅 주차: <b>{week_label_safe}</b>\n\n"
+                        f"📊 <b>이번 주 결석자 현황</b>\n"
+                        f"   • 총 <b>{target_summary['total']}</b>명\n"
+                        f"   • 🎯 타겟 지정: <b>{target_summary['target_set']}</b>명\n"
+                        f"   • 📝 심방계획 입력: <b>{target_summary['with_plan']}</b>명\n\n"
+                        f"<b>🙏 주일까지 다음 작업을 부탁드립니다:</b>\n"
+                        f"1️⃣ 결석자 중 <b>타겟 대상 선정</b>\n"
+                        f"2️⃣ 각 타겟에 대한 <b>심방계획 작성</b>\n"
+                        f"3️⃣ <b>심방 실행 & 기록 업데이트</b>\n\n"
+                        f"<i>결석자 목록 (상위 10명)</i>\n"
+                        f"{chr(10).join(sample_names)}{more_line}\n\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"하단 <code>📋 결석자 심방</code> 버튼으로 시작하세요."
+                    )
+
+                # 5) 전송 (HTML → fallback to plain)
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+                    sent += 1
+                except Exception as e1:
+                    logger.warning("HTML send 실패 chat_id=%s: %s", chat_id, e1)
+                    try:
+                        # 평문 재시도 (HTML 태그 제거)
+                        plain = (msg.replace("<b>", "").replace("</b>", "")
+                                   .replace("<i>", "").replace("</i>", "")
+                                   .replace("<code>", "").replace("</code>", ""))
+                        await context.bot.send_message(chat_id=chat_id, text=plain)
+                        sent += 1
+                    except Exception as e2:
+                        logger.warning("평문 send 실패 chat_id=%s: %s", chat_id, e2)
+                        failed += 1
+
+            except Exception as e:
+                logger.exception("방 %s 처리 실패: %s", chat_id, e)
+                failed += 1
+
+        logger.info("📅 수요일 알림 완료: 전송 %d / 실패 %d / 총 %d", sent, failed, len(scopes))
+    except Exception as e:
+        logger.exception("wednesday_visit_plan_request_job failed: %s", e)
+
+
+async def force_wednesday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """수요일 알림 강제 실행 (테스트용)"""
+    await update.message.reply_text("📅 수요일 심방계획 요청 강제 실행 중...")
+    await wednesday_visit_plan_request_job(context)
+    await update.message.reply_text("✅ 완료")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 🆕 편의 명령어: /chatid, /approve, /deny + 승인 신청 버튼
+# ═════════════════════════════════════════════════════════════════════════════
+async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """어느 방에서든 이 방의 Chat ID 표시."""
+    import html as _html
+    chat = update.effective_chat
+    user = update.effective_user
+    chat_id = chat.id
+    chat_title = chat.title or chat.full_name or "(제목없음)"
+    chat_type = {
+        "private": "개인채팅",
+        "group": "일반 그룹",
+        "supergroup": "슈퍼그룹",
+        "channel": "채널",
+    }.get(chat.type, chat.type)
+
+    authorized = True
+    if chat.type != "private":
+        authorized = await is_chat_authorized(chat_id)
+
+    auth_badge = "✅ 승인됨" if authorized else "❌ 미승인"
+    user_line = ""
+    if user:
+        user_line = f"• 내 User ID: <code>{user.id}</code>\n"
+
+    msg = (
+        "📋 <b>방 정보</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"• Chat ID: <code>{chat_id}</code>\n"
+        f"• 방 이름: {_html.escape(chat_title)}\n"
+        f"• 방 유형: {chat_type}\n"
+        f"• 승인 상태: {auth_badge}\n"
+        f"{user_line}"
+    )
+    if not authorized and chat.type != "private":
+        msg += "\n\n👇 아래 버튼으로 관리자에게 승인 신청하기"
+        await update.message.reply_text(
+            msg, parse_mode="HTML", reply_markup=kb_request_approval()
+        )
+    else:
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+
+async def request_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """승인 신청 버튼 눌림 → 관리자들에게 DM 알림."""
+    import html as _html
+    q = update.callback_query
+    await q.answer()
+
+    chat = update.effective_chat
+    user = update.effective_user
+    chat_id = chat.id
+    chat_title = chat.title or chat.full_name or "(제목없음)"
+    requester_name = user.full_name if user else "(알 수 없음)"
+    requester_id = user.id if user else 0
+
+    # 이미 승인되었으면 스킵
+    if await is_chat_authorized(chat_id):
+        await q.message.reply_text("✅ 이 방은 이미 승인되어 있습니다. /start 로 시작하세요.")
+        return
+
+    # 관리자 목록 조회
+    admins = await get_active_bot_admins()
+    if not admins:
+        await q.message.reply_text(
+            "⚠️ <b>등록된 관리자가 없습니다.</b>\n\n"
+            "관리자가 웹 대시보드에서 이 Chat ID 를 직접 승인해야 합니다:\n"
+            f"<code>{chat_id}</code>\n\n"
+            f"관리자에게 직접 전달해주세요.",
+            parse_mode="HTML",
+        )
+        return
+
+    # 관리자에게 DM 알림
+    admin_msg = (
+        "🔔 <b>새 방 승인 신청</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📋 <b>신청 방 정보</b>\n"
+        f"• Chat ID: <code>{chat_id}</code>\n"
+        f"• 방 이름: {_html.escape(chat_title)}\n"
+        f"• 방 유형: {chat.type}\n\n"
+        f"👤 <b>신청자</b>\n"
+        f"• 이름: {_html.escape(requester_name)}\n"
+        f"• User ID: <code>{requester_id}</code>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ <b>승인 방법</b>\n"
+        f"• 아래 ✅ 승인 버튼을 누르거나\n"
+        f"• 명령어로: <code>/approve {chat_id}</code>\n\n"
+        f"❌ <b>거부 방법</b>\n"
+        f"• 아래 ❌ 거부 버튼을 누르거나\n"
+        f"• 명령어로: <code>/deny {chat_id}</code>"
+    )
+    approve_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ 승인", callback_data=f"admin_approve:{chat_id}"),
+        InlineKeyboardButton("❌ 거부", callback_data=f"admin_deny:{chat_id}"),
+    ]])
+
+    delivered = 0
+    failed = 0
+    for admin in admins:
+        admin_uid = admin.get("user_id")
+        if not admin_uid:
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=admin_uid,
+                text=admin_msg,
+                parse_mode="HTML",
+                reply_markup=approve_kb,
+            )
+            delivered += 1
+        except Exception as e:
+            logger.warning("관리자 %s DM 실패: %s", admin_uid, e)
+            failed += 1
+
+    # 신청자에게 결과 안내
+    if delivered > 0:
+        await q.message.reply_text(
+            f"✅ <b>승인 신청 완료</b>\n\n"
+            f"{delivered}명의 관리자에게 승인 요청이 전달되었습니다.\n"
+            f"관리자 승인 후 이 방에서 <code>/start</code> 재실행하시면 됩니다.\n\n"
+            f"<i>Chat ID: {chat_id}</i>",
+            parse_mode="HTML",
+        )
+    else:
+        await q.message.reply_text(
+            f"⚠️ 관리자 알림 전송 실패.\n\n"
+            f"관리자에게 직접 이 Chat ID를 전달해주세요: <code>{chat_id}</code>\n\n"
+            f"💡 관리자가 봇에게 개인채팅으로 <code>/start</code> 를 먼저 실행해야 DM 수신 가능합니다.",
+            parse_mode="HTML",
+        )
+
+
+async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """관리자 전용: /approve <chat_id> 로 방 승인."""
+    import html as _html
+    user = update.effective_user
+    if not user or not await is_bot_admin_user(user.id):
+        await update.message.reply_text("🔒 이 명령은 관리자만 사용 가능합니다.")
+        return
+
+    args = context.args if hasattr(context, 'args') else []
+    if not args:
+        await update.message.reply_text(
+            "ℹ️ 사용법: <code>/approve &lt;chat_id&gt;</code>\n예: <code>/approve -1001234567890</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        target_chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Chat ID는 숫자여야 합니다.")
+        return
+
+    admin_name = user.full_name or user.username or f"user_{user.id}"
+    try:
+        await sb_rpc("upsert_authorized_chat", {
+            "p_chat_id": target_chat_id,
+            "p_chat_title": None,
+            "p_notes": f"{admin_name} 님이 /approve 로 승인",
+            "p_is_active": True,
+            "p_authorized_by": admin_name,
+        })
+    except Exception as e:
+        await update.message.reply_text(f"❌ 승인 실패: {e}")
+        return
+
+    await update.message.reply_text(
+        f"✅ <b>승인 완료</b>\n\n"
+        f"Chat ID: <code>{target_chat_id}</code>\n"
+        f"승인자: {_html.escape(admin_name)}\n\n"
+        f"해당 방에서 <code>/start</code> 재실행하면 정상 작동합니다.",
+        parse_mode="HTML"
+    )
+
+    # 승인된 방에 알림 발송 시도
+    try:
+        await context.bot.send_message(
+            chat_id=target_chat_id,
+            text=(
+                f"✅ <b>이 방이 승인되었습니다!</b>\n\n"
+                f"승인자: {_html.escape(admin_name)}\n\n"
+                f"이제 <code>/start</code> 로 봇 사용을 시작하세요."
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.info("승인된 방에 알림 발송 실패 (봇이 아직 방에 있지 않을 수 있음): %s", e)
+
+
+async def deny_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """관리자 전용: /deny <chat_id> 로 방 거부."""
+    user = update.effective_user
+    if not user or not await is_bot_admin_user(user.id):
+        await update.message.reply_text("🔒 이 명령은 관리자만 사용 가능합니다.")
+        return
+
+    args = context.args if hasattr(context, 'args') else []
+    if not args:
+        await update.message.reply_text(
+            "ℹ️ 사용법: <code>/deny &lt;chat_id&gt;</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        target_chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Chat ID는 숫자여야 합니다.")
+        return
+
+    await update.message.reply_text(
+        f"❌ <b>거부 처리</b>\n\n"
+        f"Chat ID: <code>{target_chat_id}</code>\n"
+        f"(승인 목록에 추가하지 않음)",
+        parse_mode="HTML"
+    )
+
+
+async def admin_approve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """관리자 DM 에서 ✅ 승인 버튼 클릭 처리."""
+    import html as _html
+    q = update.callback_query
+    user = update.effective_user
+
+    if not user or not await is_bot_admin_user(user.id):
+        await q.answer("🔒 관리자만 가능", show_alert=True)
+        return
+
+    data = q.data or ""
+    try:
+        target_chat_id = int(data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await q.answer("❌ 잘못된 데이터", show_alert=True)
+        return
+
+    await q.answer("처리 중...")
+    admin_name = user.full_name or user.username or f"user_{user.id}"
+
+    try:
+        await sb_rpc("upsert_authorized_chat", {
+            "p_chat_id": target_chat_id,
+            "p_chat_title": None,
+            "p_notes": f"{admin_name} 님이 DM 승인",
+            "p_is_active": True,
+            "p_authorized_by": admin_name,
+        })
+    except Exception as e:
+        await q.message.reply_text(f"❌ 승인 실패: {e}")
+        return
+
+    await q.edit_message_text(
+        q.message.text_html + f"\n\n━━━━━━━━━━━━━━━━━━━━\n✅ <b>{_html.escape(admin_name)}</b> 님이 승인 완료",
+        parse_mode="HTML",
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=target_chat_id,
+            text=(
+                f"✅ <b>이 방이 승인되었습니다!</b>\n\n"
+                f"승인자: {_html.escape(admin_name)}\n\n"
+                f"이제 <code>/start</code> 로 봇 사용을 시작하세요."
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.info("승인 방 알림 실패: %s", e)
+
+
+async def admin_deny_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """관리자 DM 에서 ❌ 거부 버튼 클릭 처리."""
+    import html as _html
+    q = update.callback_query
+    user = update.effective_user
+
+    if not user or not await is_bot_admin_user(user.id):
+        await q.answer("🔒 관리자만 가능", show_alert=True)
+        return
+
+    await q.answer()
+    admin_name = user.full_name or user.username or f"user_{user.id}"
+    await q.edit_message_text(
+        q.message.text_html + f"\n\n━━━━━━━━━━━━━━━━━━━━\n❌ <b>{_html.escape(admin_name)}</b> 님이 거부",
+        parse_mode="HTML",
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # 앱 시작
 # ═════════════════════════════════════════════════════════════════════════════
 MINIAPP_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp.html")
@@ -2236,19 +3041,35 @@ def main():
     app.add_handler(CommandHandler("myscope",  myscope_command))
     app.add_handler(CommandHandler("diagnose", diagnose_command))
     app.add_handler(CommandHandler("weektest", force_weekly_command))
+    app.add_handler(CommandHandler("wedtest",  force_wednesday_command))
+    # 🆕 편의 명령어
+    app.add_handler(CommandHandler("chatid",   chatid_command))
+    app.add_handler(CommandHandler("approve",  approve_command))
+    app.add_handler(CommandHandler("deny",     deny_command))
 
     app.add_handler(CallbackQueryHandler(button_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
 
-    # 매주 화요일 19시 KST (python-telegram-bot v20: 월=0, 화=1, ..., 일=6)
+    # 📅 스케줄 (python-telegram-bot v20: 월=0, 화=1, 수=2, 목=3, 금=4, 토=5, 일=6)
     if app.job_queue is not None:
+        # 🔔 [기존] 특별관리(연속결석) 주간 리마인더
+        # 기존: 화요일 19시 → 변경: 목요일 07시 KST
         app.job_queue.run_daily(
             weekly_reminder_job,
-            time=dtime(hour=WEEKLY_REMINDER_HOUR, minute=WEEKLY_REMINDER_MIN, tzinfo=KST),
-            days=(1,),
+            time=dtime(hour=7, minute=0, tzinfo=KST),
+            days=(3,),  # 목요일
             name="weekly_special_reminder",
         )
-        logger.info("📅 weekly reminder: 화 %02d:%02d KST", WEEKLY_REMINDER_HOUR, WEEKLY_REMINDER_MIN)
+        logger.info("📅 특별관리 리마인더: 매주 목요일 07:00 KST")
+
+        # 🆕 [신규] 매주 수요일 07시 KST - 모든 봇 방에 결석자 심방계획 요청
+        app.job_queue.run_daily(
+            wednesday_visit_plan_request_job,
+            time=dtime(hour=7, minute=0, tzinfo=KST),
+            days=(2,),  # 수요일
+            name="wednesday_visit_plan_request",
+        )
+        logger.info("📅 수요일 심방계획 요청: 매주 수요일 07:00 KST")
     else:
         logger.warning("⚠ JobQueue unavailable")
 
