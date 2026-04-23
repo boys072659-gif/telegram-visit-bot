@@ -162,6 +162,115 @@ async def sb_rpc(func: str, payload: dict):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 이름 마스킹 복구 ("김*영" → 교적에서 "김지영" 찾아 반환)
+# ═════════════════════════════════════════════════════════════════════════════
+import re as _re_name
+
+def _is_masked_name(s: str) -> bool:
+    """이름에 * 같은 마스킹 문자가 있는지"""
+    if not s: return False
+    return ('*' in s) or ('_' in s and len(s) <= 5)
+
+
+async def resolve_real_name(
+    masked_name: str,
+    church: str = None,
+    dept: str = None,
+    phone_last4: str = None,
+) -> str:
+    """
+    마스킹된 이름(예: 김*영)을 교적에서 역조회하여 실제 이름으로 복구.
+    매칭 우선순위:
+      1. church + dept + phone_last4 + 이름 패턴
+      2. church + phone_last4 + 이름 패턴
+      3. phone_last4 + 이름 패턴
+    매칭 실패 시 원래 마스킹 이름 반환.
+    """
+    if not masked_name or not _is_masked_name(masked_name):
+        return masked_name
+
+    # 이름 패턴 생성: "김*영" → "^김.영$"
+    try:
+        pattern = '^' + _re_name.escape(masked_name).replace(r'\*', '.').replace(r'\_', '.') + '$'
+    except Exception:
+        return masked_name
+
+    # 1차: 교회 + 부서 + 전화뒷4 일치
+    params = []
+    if church:     params.append(f"church=eq.{quote(church)}")
+    if dept:       params.append(f"dept=eq.{quote(dept)}")
+    if phone_last4:params.append(f"phone_last4=eq.{quote(phone_last4)}")
+    params.append("limit=30")
+
+    if len(params) >= 3:  # 최소 교회+뭔가+전화 또는 뭔가 2개+전화
+        try:
+            rows = await sb_get(f"church_member_registry?select=name&" + "&".join(params))
+            for r in rows or []:
+                nm = r.get("name", "")
+                if nm and _re_name.match(pattern, nm):
+                    return nm
+        except Exception:
+            pass
+
+    # 2차: 교회 + 전화뒷4
+    if church and phone_last4:
+        try:
+            rows = await sb_get(
+                f"church_member_registry?select=name"
+                f"&church=eq.{quote(church)}&phone_last4=eq.{quote(phone_last4)}&limit=30"
+            )
+            for r in rows or []:
+                nm = r.get("name", "")
+                if nm and _re_name.match(pattern, nm):
+                    return nm
+        except Exception:
+            pass
+
+    # 3차: 전화뒷4만 (마지막 수단)
+    if phone_last4:
+        try:
+            rows = await sb_get(
+                f"church_member_registry?select=name,church"
+                f"&phone_last4=eq.{quote(phone_last4)}&limit=30"
+            )
+            # 교회 일치하면 우선 반환
+            for r in rows or []:
+                nm = r.get("name", "")
+                if not nm: continue
+                if not _re_name.match(pattern, nm): continue
+                if church and r.get("church") == church:
+                    return nm
+            # 교회 안 맞아도 패턴 일치면 반환
+            for r in rows or []:
+                nm = r.get("name", "")
+                if nm and _re_name.match(pattern, nm):
+                    return nm
+        except Exception:
+            pass
+
+    return masked_name  # 매칭 실패 시 원본 반환
+
+
+async def enrich_names(rows: list, church_key: str = "church", dept_key: str = "dept",
+                       name_key: str = "name", phone_key: str = "phone_last4") -> list:
+    """결석자 행 목록을 받아서 각 행의 name을 실제 이름으로 복구."""
+    if not rows: return rows
+    for r in rows:
+        nm = r.get(name_key, "")
+        if _is_masked_name(nm):
+            real = await resolve_real_name(
+                nm,
+                church=r.get(church_key),
+                dept=r.get(dept_key),
+                phone_last4=r.get(phone_key),
+            )
+            if real and real != nm:
+                r[name_key] = real
+                r["_original_name"] = nm  # 원본 보존
+    return rows
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # 주차 계산 (화요일 18시 KST 기준)
 # ═════════════════════════════════════════════════════════════════════════════
 def compute_target_week_key() -> tuple[str, str]:
@@ -274,21 +383,27 @@ async def fetch_absentees_by_region(week_key: str, church: str, dept: str, regio
         })
         if rows is None: rows = []
         # RPC는 church 필터가 없으니 클라이언트에서 교회 필터
-        return [r for r in rows if r.get("church", church) == church or not r.get("church")]
+        rows = [r for r in rows if r.get("church", church) == church or not r.get("church")]
+        # dept 정보를 추가 (RPC가 반환 안 할 수 있음)
+        for r in rows:
+            if not r.get("dept"): r["dept"] = dept
+            if not r.get("church"): r["church"] = church
+        return await enrich_names(rows)
     except Exception as e:
         logger.info("RPC get_absentees_by_dept_region 폴백: %s", e)
 
     # REST 폴백
     path = (
         f"weekly_visit_targets"
-        f"?select=row_id,name,phone_last4,church,region_name,zone_name,consecutive_absent_count"
+        f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
         f"&week_key=eq.{quote(week_key)}"
         f"&church=eq.{quote(church)}"
         f"&dept=eq.{quote(dept)}"
         f"&region_name=eq.{quote(region)}"
         f"&order=zone_name.asc,name.asc"
     )
-    return await sb_get(path)
+    rows = await sb_get(path)
+    return await enrich_names(rows)
 
 
 async def fetch_absentees_by_zone(week_key: str, church: str, dept: str, zone: str):
@@ -300,7 +415,11 @@ async def fetch_absentees_by_zone(week_key: str, church: str, dept: str, zone: s
             "p_week_key": week_key, "p_dept": dept, "p_zone": normalized
         })
         if rows is None: rows = []
-        return [r for r in rows if r.get("church", church) == church or not r.get("church")]
+        rows = [r for r in rows if r.get("church", church) == church or not r.get("church")]
+        for r in rows:
+            if not r.get("dept"): r["dept"] = dept
+            if not r.get("church"): r["church"] = church
+        return await enrich_names(rows)
     except Exception as e:
         logger.info("RPC get_absentees_by_dept_zone 폴백: %s", e)
 
@@ -308,7 +427,7 @@ async def fetch_absentees_by_zone(week_key: str, church: str, dept: str, zone: s
     for try_zone in [normalized, zone]:
         path = (
             f"weekly_visit_targets"
-            f"?select=row_id,name,phone_last4,church,region_name,zone_name,consecutive_absent_count"
+            f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
             f"&week_key=eq.{quote(week_key)}"
             f"&church=eq.{quote(church)}"
             f"&dept=eq.{quote(dept)}"
@@ -316,7 +435,7 @@ async def fetch_absentees_by_zone(week_key: str, church: str, dept: str, zone: s
             f"&order=name.asc"
         )
         rows = await sb_get(path)
-        if rows: return rows
+        if rows: return await enrich_names(rows)
     return []
 
 
@@ -327,20 +446,25 @@ async def fetch_absentees_4plus(week_key: str, church: str, dept: str):
             "p_week_key": week_key, "p_dept": dept
         })
         if rows is None: rows = []
-        return [r for r in rows if r.get("church", church) == church or not r.get("church")]
+        rows = [r for r in rows if r.get("church", church) == church or not r.get("church")]
+        for r in rows:
+            if not r.get("dept"): r["dept"] = dept
+            if not r.get("church"): r["church"] = church
+        return await enrich_names(rows)
     except Exception as e:
         logger.info("RPC get_absentees_4plus_by_dept 폴백: %s", e)
 
     path = (
         f"weekly_visit_targets"
-        f"?select=row_id,name,phone_last4,church,region_name,zone_name,consecutive_absent_count"
+        f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
         f"&week_key=eq.{quote(week_key)}"
         f"&church=eq.{quote(church)}"
         f"&dept=eq.{quote(dept)}"
         f"&consecutive_absent_count=gte.4"
         f"&order=consecutive_absent_count.desc,name.asc"
     )
-    return await sb_get(path)
+    rows = await sb_get(path)
+    return await enrich_names(rows)
 
 
 async def get_progress(week_key: str, row_id: str):
@@ -467,187 +591,430 @@ def kb_dept_select(flow: str, church: str) -> InlineKeyboardMarkup:
 # ═════════════════════════════════════════════════════════════════════════════
 # 명령어 핸들러
 # ═════════════════════════════════════════════════════════════════════════════
-HELP_TEXT_1 = (
-    "📖 *결석자 타겟 심방 봇 — 전체 사용법 (1/2)*\n"
+HELP_TEXT = (
+    "📖 *결석자 타겟 심방 봇 — 사용법*\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-    "*📑 목차*\n"
-    "1. 기본 명령어\n"
-    "2. 하단 키보드 (⌨️) 사용법\n"
-    "3. 결석자 심방 기록 (8단계)\n"
-    "4. 특별관리결석자 (4항목 관리)\n"
-    "5. 미니앱 — 성도 정보 등록\n"
-    "6. 주차 / 연속결석 자동 규칙\n"
-    "7. 문제 해결 · FAQ\n"
-    "━━━━━━━━━━━━━━━━━━━━\n\n"
+    "*1️⃣ 방 설정 (최초 1회)*\n"
+    "`/start` 또는 `/setup` 으로 이 방의 담당 범위 설정:\n"
+    "   교회 → 부서 → 지역 → 구역\n"
+    "교회까지만 설정하면 *교회 전체 결석자* 조회 가능\n"
+    "설정 후 `📋 결석자 심방` 에서 해당 범위의 결석자만 표시\n\n"
 
-    "*1️⃣ 기본 명령어*\n"
-    "• `/start` — 메인 메뉴 + 하단 키보드 + 전체 사용법\n"
-    "• `/menu` — 메인 메뉴 다시 열기\n"
-    "• `/help` — 이 안내 (도움말)\n"
-    "• `/cancel` — 현재 입력 흐름 중단\n"
-    "• `/diagnose` — DB 연결 / 주차 / 결석자 데이터 확인\n"
-    "• `/weektest` — 주간 리마인더 즉시 실행 (테스트용)\n\n"
+    "*2️⃣ 결석자 심방 기록 흐름*\n"
+    "메인 메뉴 → `📋 결석자 심방` 탭\n"
+    "→ 결석자 선택 → *8단계* 순차 입력:\n"
+    "   ① 심방자 ② 심방날짜 ③ 심방계획\n"
+    "   ④ 타겟여부 ⑤ 진행여부 ⑥ 예배확답\n"
+    "   ⑦ 진행사항 ⑧ 예배참석\n"
+    "→ 모든 필드 완료 후 확인 → 저장\n"
+    "입력 중 `❌ 입력 취소` 버튼 또는 `/cancel` 로 중단 가능\n\n"
 
-    "*2️⃣ 하단 키보드 (⌨️) 사용법*\n"
-    "메시지 입력창 오른쪽의 *⌨️ 키보드 아이콘*을 탭하면 하단에 고정 버튼이 펼쳐집니다.\n"
-    "자판 대신 버튼을 누르는 방식이라 빠릅니다.\n\n"
-    "🔹 하단 키보드 버튼 5개:\n"
-    "   • 📋 *결석자 심방* — 교회/부서/지역 선택해서 기록\n"
-    "   • 🚨 *특별관리결석자* — 4회+ 결석자 집중관리\n"
-    "   • 📝 *결석자 심방 기록(폼)* — 미니앱 폼 열기\n"
-    "   • ❓ *사용법* — 이 도움말\n"
-    "   • 🏠 *메인 메뉴* — 메인 버튼 다시 보기\n\n"
-    "_하단 키보드가 사라진 경우_ `/menu` 를 입력하면 다시 나타납니다.\n\n"
+    "*3️⃣ 특별관리 결석자 (연속결석 4회 이상)*\n"
+    "메인 메뉴 → `🚨 특별관리결석자` 탭\n"
+    "→ 교회 → 부서 → 결석자 선택\n"
+    "→ 이 방이 *감지방* 으로 등록되고 4항목 체크리스트 표시:\n"
+    "   ① 대책방 초대완료 (최초 1회)\n"
+    "   ② 금주 피드백 진행 (주간 리셋)\n"
+    "   ③ 금주 심방예정일\n"
+    "   ④ 금주 심방계획\n"
+    f"매주 화요일 {WEEKLY_REMINDER_HOUR:02d}:{WEEKLY_REMINDER_MIN:02d} KST 에 미체크 항목 리마인더 발송\n\n"
 
-    "*3️⃣ 결석자 심방 기록 (일반 흐름)*\n"
-    "📋 *결석자 심방* 버튼 → 다음 순서대로:\n\n"
-    "① *교회* 버튼 선택\n"
-    "   (서울/포천/구리/동대문/의정부 교회)\n\n"
-    "② *부서* 버튼 선택\n"
-    "   (자문회/장년회/부녀회/청년회)\n\n"
-    "③ *지역 또는 구역* 을 텍스트로 입력\n"
-    "   • 지역 예: `강북`, `강남`, `강서`, `강동`, `노원`\n"
-    "   • 구역 예: `2-1` 또는 `2팀1` (둘 다 동일 처리)\n"
-    "   _결석자가 없으면 사용 가능한 지역·구역 목록을 자동 안내_\n\n"
-    "④ 결석자 *버튼 목록*에서 심방 기록할 사람 탭\n"
-    "   _이름 옆 '연속 N회' 로 연속결석 횟수 표시_\n\n"
-    "⑤ *8단계* 기록 순서:\n"
-    "   1️⃣ 심방자 (직접 입력 — 예: 홍길동(집사))\n"
-    "   2️⃣ 심방날짜 (직접 입력 — 예: 4/27 또는 2026-04-27)\n"
-    "   3️⃣ 심방계획 (직접 입력)\n"
-    "   4️⃣ 타겟여부 → 버튼: 타겟 / 미타겟\n"
-    "   5️⃣ 진행여부 → 버튼: 완료 / 미완료\n"
-    "   6️⃣ 예배확답 → 버튼: 확정 / 미정 / 불참\n"
-    "   7️⃣ 진행사항 (직접 입력 — 없으면 '없음')\n"
-    "   8️⃣ 예배참석 → 버튼: 참석 / 불참\n\n"
-    "⑥ 확인 화면 → ✅ *저장* 또는 ❌ *취소*\n"
-    "   _이전에 기록한 값이 있으면 자동 미리보기_\n\n"
+    "*4️⃣ 미니앱 (개인 채팅에서만)*\n"
+    "`📝 결석자 심방 기록 (폼)` 버튼 탭\n"
+    "→ 이름+전화뒷4로 결석자 검색\n"
+    "→ 기존 심방 기록 자동 로드 → 보충/수정 후 저장\n"
+    "⚠️ 그룹방에서는 미니앱 버튼 안 보임 (텔레그램 정책)\n\n"
 
-    "*4️⃣ 특별관리결석자 (4항목 관리)*\n"
-    "🚨 *특별관리결석자* 버튼 → 다음 순서:\n\n"
-    "① 교회 → 부서 선택\n\n"
-    "② 연속결석 *4회 이상* 명단만 표시됨\n"
-    "   • 🚨 = 이미 특별관리 등록된 (방 감지중)\n"
-    "   • ⚠️ = 아직 미등록\n\n"
-    "③ 대상 선택 → *이 방이 감지방으로 자동 등록*\n"
-    "   이후 이 대상 관련 알림은 모두 이 방으로 발송됨\n\n"
-    "④ 4항목 체크리스트 관리:\n"
-    "   1️⃣ *대책방 초대완료* — 구역장·인섬교·강사·전도사·심방부사명자\n"
-    "      _(최초 1회만 체크, 주간 리셋 안 됨)_\n"
-    "   2️⃣ *금주 피드백 진행* _(매주 리셋)_\n"
-    "   3️⃣ *금주 심방예정일* _(텍스트 입력, 매주 리셋)_\n"
-    "   4️⃣ *금주 심방계획* _(텍스트 입력, 매주 리셋)_\n\n"
-    "⑤ 버튼 조작:\n"
-    "   • ⬜️/✅ 버튼 탭 → 1·2번 체크 토글\n"
-    "   • 📅 3번 / 📝 4번 → 텍스트 입력 화면\n"
-    "   • 🗑 해제 → 특별관리에서 제외\n\n"
-    f"⑥ *매주 화요일 {WEEKLY_REMINDER_HOUR:02d}:{WEEKLY_REMINDER_MIN:02d} KST 자동 리마인더*\n"
-    "   • 미체크 항목 리스트가 이 방으로 자동 발송\n"
-    "   • 동시에 2·3·4번 항목 자동 초기화\n"
-    "   • 1번(대책방 초대)은 리셋되지 않음\n\n"
+    "*5️⃣ 명령어 모음*\n"
+    "• `/start` — 방 설정 + 메인 메뉴\n"
+    "• `/menu` — 메인 메뉴\n"
+    "• `/setup` — 방 범위 재설정 (최초 설정자만)\n"
+    "• `/myscope` — 이 방의 현재 범위 확인\n"
+    "• `/cancel` — 현재 입력 중단\n"
+    "• `/help` — 이 사용법\n"
+    "• `/diagnose` — DB 진단\n\n"
 
-    "👉 계속: 미니앱·주차규칙·FAQ 는 두 번째 메시지에서 확인하세요.\n"
-)
-
-HELP_TEXT_2 = (
-    "📖 *사용법 (2/2) — 미니앱·주차규칙·FAQ*\n"
-    "━━━━━━━━━━━━━━━━━━━━\n\n"
-
-    "*5️⃣ 미니앱 — 결석자 심방 기록 (이어쓰기 가능)*\n"
-    "하단 키보드 📝 *결석자 심방 기록(폼)* 또는\n"
-    "메인 메뉴의 📝 *결석자 심방 기록 (미니웹앱)* 버튼을 탭하면\n"
-    "텔레그램 안에 *네이티브 폼*이 열립니다.\n\n"
-    "🔹 *STEP 1: 결석자 검색*\n"
-    "   • 이름, 전화번호 뒷4자리, 교회, 부서 입력\n"
-    "   • 결석자 명단에서 해당 결석자를 찾음\n\n"
-    "🔹 *STEP 2: 심방 기록 입력*\n"
-    "   자동으로 열리며, 결석자 정보 + 기존 기록이 표시됨\n"
-    "   • 지역 / 구역\n"
-    "   • 1️⃣ 심방자\n"
-    "   • 2️⃣ 심방날짜\n"
-    "   • 3️⃣ 심방계획\n"
-    "   • 4️⃣ 타겟여부 (타겟/미타겟)\n"
-    "   • 5️⃣ 진행여부 (완료/미완료)\n"
-    "   • 6️⃣ 예배확답 (확정/미정/불참)\n"
-    "   • 7️⃣ 진행사항\n"
-    "   • 8️⃣ 예배참석 (참석/불참)\n\n"
-    "🔹 *이어쓰기 지원* ✨\n"
-    "   • 같은 결석자를 나중에 다시 검색하면 *이전에 저장한 내용이 전부 자동으로 표시*됨\n"
-    "   • 부족한 항목만 채우거나 기존 값 수정 후 💾 저장\n"
-    "   • 빈 칸으로 두고 저장하면 *기존 값 유지* (덮어쓰지 않음)\n\n"
-    "🔹 *언제 사용?*\n"
-    "   • 외출 중 빠르게 심방 결과 입력\n"
-    "   • 처음엔 심방날짜만 입력하고, 심방 후 진행사항을 추가로 입력\n"
-    "   • 타겟 선정만 먼저 하고 나중에 심방자 배정\n\n"
-    "🔹 *봇 메뉴의 📋 결석자 심방과 차이*\n"
-    "   • 📋 결석자 심방 (인라인 흐름): 교회→부서→지역→결석자→8단계 순차\n"
-    "   • 📝 미니앱 (이 기능): 이름+전화뒷4로 바로 검색, 모든 필드를 한 화면에\n\n"
-
-    "*6️⃣ 주차 / 연속결석 자동 규칙*\n\n"
-    "🔹 *화요일 18시 KST 기준 자동 주차 전환*\n"
-    "   • 화요일 18시 이전 → 지난 주일 주차 표시\n"
-    "   • 화요일 18시 이후 → 이번 주 일요일 주차로 전환\n"
-    "   • 따라서 화요일 저녁 명단 업로드가 바로 다음 주일에 반영\n\n"
-    "🔹 *연속결석 횟수*\n"
-    "   • 업로드된 CSV의 *연속결석 값이 그대로 저장*됩니다\n"
-    "   • 자동 +1 처리는 *비활성화* 되어 있음 (CSV 값 신뢰)\n"
-    "   • 같은 주차 재업로드 시 *기존 심방기록 완전 보존*\n\n"
-    "🔹 *구역 이름 정규화*\n"
-    "   • `2-1` ↔ `2팀1` 은 내부적으로 동일 처리\n"
-    "   • 공백·밑줄도 자동 정리\n\n"
-    "🔹 *가족/가족외 자동 분류* (교적 업로드 시)\n"
-    "   • 웹 관리자 → 성도 등록에 교적 CSV 올리면\n"
-    "   • 결석자 테이블에 🟡가족 / 🟣가족외 뱃지 자동 표시\n\n"
-
-    "*7️⃣ 문제 해결 · FAQ*\n\n"
-    "❓ *'결석자가 없습니다' 라고 나와요*\n"
-    "   → 지역/구역 이름 철자 확인 (봇이 자동으로 사용 가능한 이름 목록 보여줌)\n"
-    "   → 웹에서 이번 주차 명단이 업로드됐는지 확인\n"
-    "   → `/diagnose` 으로 DB 상태 확인\n\n"
-    "❓ *'세션 만료'라고 나와요*\n"
-    "   → `/menu` 입력해서 처음부터 다시 시작\n\n"
-    "❓ *하단 키보드가 사라졌어요*\n"
-    "   → `/menu` 입력하면 재표시됨\n\n"
-    "❓ *미니앱(폼) 버튼이 안 보여요*\n"
-    "   → 관리자에게 `MINIAPP_URL` 환경변수 설정 요청 (HTTPS 필수)\n\n"
-    "❓ *특별관리 리마인더가 안 와요*\n"
-    "   → 대상을 이 방에서 '등록' 단계까지 완료했는지 확인\n"
-    f"   → 매주 화요일 {WEEKLY_REMINDER_HOUR:02d}:{WEEKLY_REMINDER_MIN:02d} KST 발송\n"
-    "   → `/weektest` 로 즉시 실행 테스트\n\n"
-    "❓ *연속결석 숫자가 이상해요*\n"
-    "   → CSV 업로드 값이 그대로 DB에 저장됩니다 (자동 +1 없음)\n"
-    "   → 이상하면 CSV를 수정하여 재업로드 (기존 심방기록 유지됨)\n\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "🌐 *상세 현황·분석·CSV·교회 비교 등은 웹 대시보드에서.*\n"
-    "💬 문제가 있으면 `/diagnose` 결과 스크린샷을 관리자에게 전달해주세요.\n"
+    "🌐 *상세 분석·통계·CSV 는 웹 대시보드에서.*\n"
+    "💬 문제 있으면 `/diagnose` 결과를 관리자에게.\n"
 )
 
-# 하위 호환용 (기존 코드에서 HELP_TEXT 참조하는 곳)
-HELP_TEXT = HELP_TEXT_1 + "\n\n" + HELP_TEXT_2
+# 하위 호환
+HELP_TEXT_1 = HELP_TEXT
+HELP_TEXT_2 = ""
 
 async def _send_help(update: Update):
-    """도움말을 2개 메시지로 나눠서 전송 (텔레그램 4096자 제한 대응)."""
-    await update.message.reply_text(HELP_TEXT_1, parse_mode="Markdown")
-    await update.message.reply_text(HELP_TEXT_2, parse_mode="Markdown", reply_markup=kb_main_menu(is_private_chat(update)))
+    """도움말 전송 (한 메시지, 4096자 이하로 유지)."""
+    await safe_reply_text(update.message, HELP_TEXT, parse_mode="Markdown",
+                          reply_markup=kb_main_menu(is_private_chat(update)))
+
+
+async def safe_reply_text(message, text: str, **kwargs):
+    """Markdown 파싱 실패 시 plain text로 fallback."""
+    try:
+        return await message.reply_text(text, **kwargs)
+    except Exception as e:
+        emsg = str(e).lower()
+        if "parse" in emsg or "entity" in emsg or "markdown" in emsg:
+            kwargs.pop("parse_mode", None)
+            plain = text
+            for ch in ("*", "_", "`"):
+                plain = plain.replace(ch, "")
+            return await message.reply_text(plain, **kwargs)
+        raise
+
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 방별 범위(scope) 관리 — 교회/부서/지역/구역 고정
+# ═════════════════════════════════════════════════════════════════════════════
+async def get_chat_scope(chat_id: int) -> dict | None:
+    """이 방의 현재 범위 반환. 미설정이면 None."""
+    try:
+        rows = await sb_rpc("get_chat_scope", {"p_chat_id": chat_id})
+        if rows and len(rows) > 0:
+            s = rows[0]
+            if s.get("church"):  # 최소 교회는 있어야 설정된 것으로 간주
+                return s
+        return None
+    except Exception as e:
+        logger.warning("get_chat_scope 실패: %s", e)
+        return None
+
+
+async def save_chat_scope(
+    chat_id: int, chat_title: str,
+    church: str = None, dept: str = None,
+    region_name: str = None, zone_name: str = None,
+    owner_user_id: int = None, owner_name: str = None,
+):
+    try:
+        await sb_rpc("set_chat_scope", {
+            "p_chat_id": chat_id,
+            "p_chat_title": chat_title or "",
+            "p_church": church,
+            "p_dept": dept,
+            "p_region_name": region_name,
+            "p_zone_name": zone_name,
+            "p_owner_user_id": owner_user_id,
+            "p_owner_name": owner_name,
+        })
+        return True
+    except Exception as e:
+        logger.warning("save_chat_scope 실패: %s", e)
+        return False
+
+
+async def check_scope_owner(chat_id: int, user_id: int) -> tuple[bool, str]:
+    """
+    이 방의 scope를 이 사용자가 변경할 수 있는지 확인.
+    반환: (허용여부, 사유메시지)
+    """
+    s = await get_chat_scope(chat_id)
+    if not s:
+        return True, ""  # 최초 설정
+    owner = s.get("owner_user_id")
+    if not owner:
+        return True, ""  # owner 미지정 → 누구나
+    if int(owner) == int(user_id):
+        return True, ""
+    owner_name = s.get("owner_name") or "최초 설정자"
+    return False, f"이 방의 범위는 *{md(owner_name)}* 님만 변경할 수 있습니다."
+
+
+def scope_label(s: dict) -> str:
+    """범위 설명 텍스트"""
+    if not s: return "설정 안 됨"
+    parts = []
+    if s.get("church"): parts.append(s["church"])
+    if s.get("dept"):   parts.append(s["dept"])
+    if s.get("region_name"): parts.append(f"{s['region_name']} 지역")
+    if s.get("zone_name"):   parts.append(f"{s['zone_name']} 구역")
+    return " / ".join(parts) if parts else "설정 안 됨"
+
+
+async def scope_filter_absentees(chat_id: int, week_key: str) -> list:
+    """현재 방의 scope에 맞는 결석자 목록 반환."""
+    s = await get_chat_scope(chat_id)
+    if not s or not s.get("church"):
+        return []
+    # scope 범위별 path 구성
+    path = (
+        f"weekly_visit_targets"
+        f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
+        f"&week_key=eq.{quote(week_key)}"
+        f"&church=eq.{quote(s['church'])}"
+    )
+    if s.get("dept"):
+        path += f"&dept=eq.{quote(s['dept'])}"
+    if s.get("region_name"):
+        path += f"&region_name=eq.{quote(s['region_name'])}"
+    if s.get("zone_name"):
+        path += f"&zone_name=eq.{quote(normalize_zone(s['zone_name']))}"
+    path += "&order=dept.asc,region_name.asc,name.asc&limit=5000"
+    rows = await sb_get(path)
+    return await enrich_names(rows)
+
+
+# ── Setup(scope 설정) 키보드 빌더 ─────────────────────────────────────────────
+def kb_setup_church() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"⛪ {ch}", callback_data=f"scope_ch:{ch}")] for ch in CHURCHES]
+    rows.append([InlineKeyboardButton("❌ 취소", callback_data="flow_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_setup_dept(church: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"🏛 {dp}", callback_data=f"scope_dp:{dp}")] for dp in DEPTS]
+    rows.append([InlineKeyboardButton("⏭ 여기까지만 (교회 전체)", callback_data="scope_stop:church")])
+    rows.append([InlineKeyboardButton("◀ 교회 다시 선택", callback_data="scope_setup")])
+    rows.append([InlineKeyboardButton("❌ 취소", callback_data="flow_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_setup_region() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ 여기까지만 (부서 전체)", callback_data="scope_stop:dept")],
+        [InlineKeyboardButton("◀ 부서 다시 선택", callback_data="scope_setup_back_dept")],
+        [InlineKeyboardButton("❌ 취소", callback_data="flow_cancel")],
+    ])
+
+def kb_setup_zone() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ 여기까지만 (지역 전체)", callback_data="scope_stop:region")],
+        [InlineKeyboardButton("◀ 지역 다시 입력", callback_data="scope_setup_back_region")],
+        [InlineKeyboardButton("❌ 취소", callback_data="flow_cancel")],
+    ])
+
+
+async def setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """방의 담당 범위 설정 시작 (교회부터)."""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    # 이미 설정되어 있고 소유자가 다르면 차단
+    ok, reason = await check_scope_owner(chat_id, user.id if user else 0)
+    if not ok:
+        await safe_reply_text(update.message, f"❌ {reason}", parse_mode="Markdown")
+        return
+
+    # 설정 시작
+    await save_ctx(chat_id, editing_step="awaiting_scope_church")
+    current = await get_chat_scope(chat_id)
+    cur_txt = f"\n\n📌 현재 설정: *{md(scope_label(current))}*" if current else ""
+    await safe_reply_text(
+        update.message,
+        f"🔧 *방 담당 범위 설정*{cur_txt}\n\n"
+        f"이 방에서 관리할 범위를 순서대로 선택하세요.\n"
+        f"*① 교회* 를 먼저 선택하세요 👇\n\n"
+        f"💡 교회만 설정해도 되고, 더 상세히 (부서/지역/구역) 설정할 수도 있습니다.",
+        parse_mode="Markdown",
+        reply_markup=kb_setup_church(),
+    )
+
+
+async def myscope_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """현재 방 범위 조회."""
+    chat_id = update.effective_chat.id
+    s = await get_chat_scope(chat_id)
+    if not s:
+        await safe_reply_text(
+            update.message,
+            "📌 이 방은 아직 범위가 설정되지 않았습니다.\n"
+            "`/setup` 으로 먼저 담당 범위를 설정하세요.",
+            parse_mode="Markdown",
+        )
+        return
+    owner = s.get("owner_name") or "(미기록)"
+    txt = (
+        f"📌 *이 방의 담당 범위*\n\n"
+        f"{md(scope_label(s))}\n\n"
+        f"👤 최초 설정자: *{md(owner)}*\n\n"
+        f"변경하려면 `/setup` (최초 설정자만 가능)"
+    )
+    await safe_reply_text(update.message, txt, parse_mode="Markdown")
+
+
+# ── Setup 콜백 핸들러들 ───────────────────────────────────────────────────────
+async def _on_scope_church(update: Update, chat_id: int, church: str):
+    q = update.callback_query
+    user = update.effective_user
+    ok, reason = await check_scope_owner(chat_id, user.id if user else 0)
+    if not ok:
+        await q.edit_message_text(f"❌ {reason}", parse_mode="Markdown")
+        return
+    await save_ctx(chat_id, church_filter=church, editing_step="awaiting_scope_dept")
+    await q.edit_message_text(
+        f"✅ *① 교회*: {md(church)}\n\n"
+        f"*② 부서*를 선택하세요 (또는 교회 전체만 보려면 `⏭ 여기까지만`)",
+        parse_mode="Markdown",
+        reply_markup=kb_setup_dept(church),
+    )
+
+
+async def _on_scope_dept(update: Update, chat_id: int, dept: str):
+    q = update.callback_query
+    ctx = await get_ctx(chat_id)
+    church = ctx.get("church_filter") or ""
+    await save_ctx(chat_id, church_filter=church, dept_filter=dept,
+                   editing_step="awaiting_scope_region_text")
+    await q.edit_message_text(
+        f"✅ *① 교회*: {md(church)}\n"
+        f"✅ *② 부서*: {md(dept)}\n\n"
+        f"*③ 지역* 이름을 입력하세요.\n"
+        f"예) `강북`, `강남`, `노원`, `성북`, `중랑`, `대학`\n\n"
+        f"💡 부서 전체만 보려면 아래 `⏭ 여기까지만`",
+        parse_mode="Markdown",
+        reply_markup=kb_setup_region(),
+    )
+
+
+async def _on_scope_stop(update: Update, chat_id: int, stop_level: str):
+    """지정 단계에서 범위 설정 완료"""
+    q = update.callback_query
+    user = update.effective_user
+    ctx = await get_ctx(chat_id)
+    church = ctx.get("church_filter")
+    dept   = ctx.get("dept_filter") if stop_level in ("dept","region","zone") else None
+    region = ctx.get("editing_region") if stop_level in ("region","zone") else None
+    zone   = ctx.get("editing_zone") if stop_level == "zone" else None
+
+    if not church:
+        await q.edit_message_text("❌ 교회 정보가 없습니다. /setup 다시 시작.")
+        return
+
+    owner_name = (user.full_name if user else "") or (user.username if user else "")
+    chat_title = update.effective_chat.title or update.effective_chat.full_name or ""
+
+    await save_chat_scope(
+        chat_id, chat_title,
+        church=church, dept=dept, region_name=region, zone_name=zone,
+        owner_user_id=user.id if user else None,
+        owner_name=owner_name,
+    )
+    await clear_tmp(chat_id)
+
+    new_scope = {"church": church, "dept": dept, "region_name": region, "zone_name": zone}
+    await q.edit_message_text(
+        f"🎉 *방 범위 설정 완료*\n\n"
+        f"📌 {md(scope_label(new_scope))}\n"
+        f"👤 최초 설정자: *{md(owner_name or '(미기록)')}*\n\n"
+        f"이제 `📋 결석자 심방` 에서 이 범위의 결석자만 표시됩니다.\n"
+        f"범위 확인: `/myscope`\n"
+        f"변경(최초 설정자만): `/setup`",
+        parse_mode="Markdown",
+    )
+    # 메뉴 다시 표시
+    await q.message.reply_text(
+        "🏠 *메인 메뉴*",
+        parse_mode="Markdown",
+        reply_markup=kb_main_menu(is_private_chat(update)),
+    )
+
+
+async def _on_scope_text_input(update: Update, chat_id: int, text: str):
+    """scope 설정 중 텍스트 입력 처리 (지역명 또는 구역명)."""
+    ctx = await get_ctx(chat_id)
+    step = ctx.get("editing_step")
+    user = update.effective_user
+
+    if step == "awaiting_scope_region_text":
+        # 지역 입력
+        region = text.strip()
+        await save_ctx(chat_id, editing_region=region, editing_step="awaiting_scope_zone_text")
+        church = ctx.get("church_filter") or ""
+        dept = ctx.get("dept_filter") or ""
+        await safe_reply_text(
+            update.message,
+            f"✅ *① 교회*: {md(church)}\n"
+            f"✅ *② 부서*: {md(dept)}\n"
+            f"✅ *③ 지역*: {md(region)}\n\n"
+            f"*④ 구역* 이름을 입력하세요.\n"
+            f"예) `1-1`, `1팀1`, `2-3`\n\n"
+            f"💡 지역 전체만 보려면 아래 `⏭ 여기까지만`",
+            parse_mode="Markdown",
+            reply_markup=kb_setup_zone(),
+        )
+        return True
+
+    if step == "awaiting_scope_zone_text":
+        zone = text.strip()
+        await save_ctx(chat_id, editing_zone=zone)
+        # 구역까지 완료 - 바로 저장
+        church = ctx.get("church_filter") or ""
+        dept = ctx.get("dept_filter") or ""
+        region = ctx.get("editing_region") or ""
+        owner_name = (user.full_name if user else "") or (user.username if user else "")
+        chat_title = update.effective_chat.title or update.effective_chat.full_name or ""
+
+        await save_chat_scope(
+            chat_id, chat_title,
+            church=church, dept=dept, region_name=region, zone_name=zone,
+            owner_user_id=user.id if user else None,
+            owner_name=owner_name,
+        )
+        await clear_tmp(chat_id)
+
+        new_scope = {"church": church, "dept": dept, "region_name": region, "zone_name": zone}
+        await safe_reply_text(
+            update.message,
+            f"🎉 *방 범위 설정 완료*\n\n"
+            f"📌 {md(scope_label(new_scope))}\n"
+            f"👤 최초 설정자: *{md(owner_name or '(미기록)')}*\n\n"
+            f"이제 `📋 결석자 심방` 에서 이 범위의 결석자만 표시됩니다.",
+            parse_mode="Markdown",
+            reply_markup=kb_main_menu(is_private_chat(update)),
+        )
+        return True
+
+    return False
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     week_key, week_label = await get_active_week()
-    banner = (
-        "👋 *결석자 타겟 심방 봇*에 오신 것을 환영합니다\n"
-        f"📅 현재 주차: *{md(week_label) if week_label else '미등록'}*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-    )
-    # 1) 하단에 고정되는 리플라이 키보드 먼저 세팅 (⌨️ 아이콘 탭하면 펼쳐짐)
+
+    # 1) 하단에 고정되는 리플라이 키보드
     await update.message.reply_text(
-        banner + "⌨️ 하단 키보드 아이콘을 탭하면 빠른 메뉴가 열립니다.\n"
-                 "아래 버튼으로 시작하거나, 사용법을 먼저 확인하세요 👇",
+        f"👋 *결석자 타겟 심방 봇*에 오신 것을 환영합니다\n"
+        f"📅 현재 주차: *{md(week_label) if week_label else '미등록'}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"⌨️ 하단 키보드로 시작하거나, `❓ 사용법` 버튼으로 도움말을 확인하세요 👇",
         parse_mode="Markdown",
         reply_markup=kb_reply_main(is_private_chat(update)),
     )
-    # 2) 전체 사용법 (2개로 분할 전송)
-    await _send_help(update)
+
+    # 2) 방 scope 확인 — 미설정이면 setup 유도
+    scope = await get_chat_scope(chat_id)
+    if not scope:
+        # 개인채팅이 아닌 그룹/채널에서만 scope 필요
+        if is_private_chat(update):
+            # 개인방은 scope 불필요
+            await update.message.reply_text(
+                "🏠 *메인 메뉴*",
+                parse_mode="Markdown",
+                reply_markup=kb_main_menu(is_private_chat(update)),
+            )
+        else:
+            # 그룹방: scope 설정 유도
+            await update.message.reply_text(
+                f"📌 *이 방은 아직 담당 범위가 설정되지 않았습니다.*\n\n"
+                f"이 방에서 관리할 *교회 / 부서 / 지역 / 구역*을 설정해야\n"
+                f"결석자 목록이 해당 범위로 자동 필터링됩니다.\n\n"
+                f"아래 `🔧 방 범위 설정` 버튼을 눌러 시작하세요 👇\n"
+                f"💡 교회까지만 설정하면 교회 전체 결석자를 볼 수 있습니다.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔧 방 범위 설정", callback_data="scope_setup")],
+                    [InlineKeyboardButton("❓ 사용법", callback_data="show_help")],
+                ]),
+            )
+    else:
+        # 이미 설정됨 - 현재 범위 안내 + 메인 메뉴
+        await update.message.reply_text(
+            f"📌 *이 방의 담당 범위*: {md(scope_label(scope))}\n\n"
+            f"🏠 *메인 메뉴*",
+            parse_mode="Markdown",
+            reply_markup=kb_main_menu(is_private_chat(update)),
+        )
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     week_key, week_label = await get_active_week()
@@ -788,6 +1155,48 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🚫 입력이 취소되었습니다.",
                 reply_markup=kb_main_menu(is_private_chat(update)),
             )
+
+        # ── 방 범위(scope) 설정 흐름 ──
+        elif data == "scope_setup":
+            # /setup 과 동일하게 시작
+            class FakeUpd:
+                effective_chat = update.effective_chat
+                effective_user = update.effective_user
+                message = q.message
+            await setup_command(FakeUpd(), context)
+        elif data.startswith("scope_ch:"):
+            church = data.split(":", 1)[1]
+            await _on_scope_church(update, chat_id, church)
+        elif data.startswith("scope_dp:"):
+            dept = data.split(":", 1)[1]
+            await _on_scope_dept(update, chat_id, dept)
+        elif data.startswith("scope_stop:"):
+            level = data.split(":", 1)[1]
+            await _on_scope_stop(update, chat_id, level)
+        elif data == "scope_setup_back_dept":
+            ctx = await get_ctx(chat_id)
+            church = ctx.get("church_filter") or ""
+            await save_ctx(chat_id, editing_step="awaiting_scope_dept")
+            await q.edit_message_text(
+                f"✅ *① 교회*: {md(church)}\n\n"
+                f"*② 부서*를 선택하세요.",
+                parse_mode="Markdown",
+                reply_markup=kb_setup_dept(church),
+            )
+        elif data == "scope_setup_back_region":
+            ctx = await get_ctx(chat_id)
+            church = ctx.get("church_filter") or ""
+            dept = ctx.get("dept_filter") or ""
+            await save_ctx(chat_id, editing_step="awaiting_scope_region_text")
+            await q.edit_message_text(
+                f"✅ *① 교회*: {md(church)}\n"
+                f"✅ *② 부서*: {md(dept)}\n\n"
+                f"*③ 지역* 이름을 다시 입력하세요.",
+                parse_mode="Markdown",
+                reply_markup=kb_setup_region(),
+            )
+        elif data == "show_help":
+            await _send_help(update if update.message else type('X',(),{'message':q.message})())
 
         # ── 특별관리 흐름 ──
         elif data.startswith("sp_ch:"):
@@ -952,6 +1361,11 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     step = pre_step
+
+    # 0.5) 방 범위(scope) 설정 중 — 지역/구역 입력
+    if step in ("awaiting_scope_region_text", "awaiting_scope_zone_text"):
+        handled = await _on_scope_text_input(update, chat_id, text)
+        if handled: return
 
     # 1) 지역/구역 입력 대기 중
     if step == "awaiting_region_or_zone":
@@ -1626,6 +2040,8 @@ def main():
     app.add_handler(CommandHandler("menu",     menu_command))
     app.add_handler(CommandHandler("help",     help_command))
     app.add_handler(CommandHandler("cancel",   cancel_command))
+    app.add_handler(CommandHandler("setup",    setup_command))
+    app.add_handler(CommandHandler("myscope",  myscope_command))
     app.add_handler(CommandHandler("diagnose", diagnose_command))
     app.add_handler(CommandHandler("weektest", force_weekly_command))
 
