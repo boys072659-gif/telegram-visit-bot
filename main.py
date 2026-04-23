@@ -83,10 +83,12 @@ SP_ITEM_LABELS = {
 }
 
 # ── 마크다운 이스케이프 ────────────────────────────────────────────────────────
-# Telegram legacy Markdown v1: _ * ` [ 만 특수. 하지만 닫히지 않으면 파서 에러.
-# 모든 *, _, `, [ 를 이스케이프
-_MD_SPECIALS = "_*`["
+# Telegram legacy Markdown v1 파서는 * _ ` [ 가 제대로 쌍을 이루지 않으면 에러.
+# 이름 안에 * 있으면 (예: "박*준") 파서가 bold 시작으로 인식하고 닫는 * 를 못 찾아 실패.
+# 해결: 모든 동적 텍스트의 _ * ` [ ] 를 전부 이스케이프.
+_MD_SPECIALS = "_*`[]()"
 def md(s) -> str:
+    """Markdown v1에서 안전하게 표시되도록 특수문자 이스케이프."""
     if s is None: return ""
     return "".join(("\\" + c) if c in _MD_SPECIALS else c for c in str(s))
 
@@ -96,37 +98,28 @@ def plain(s) -> str:
     return str(s)
 
 
-async def safe_reply(update_or_message, text: str, reply_markup=None, edit=False):
-    """
-    마크다운 파싱 에러(특수문자 포함 이름 등) 발생 시 자동으로
-    마크다운 없이 재시도하는 안전 래퍼.
-    """
-    # update 객체인지 message 객체인지 판별
-    if hasattr(update_or_message, 'reply_text'):
-        target = update_or_message
-        reply_fn = target.reply_text
-    elif hasattr(update_or_message, 'message') and update_or_message.message:
-        reply_fn = update_or_message.message.reply_text
-    else:
-        # callback_query.message
-        reply_fn = update_or_message.reply_text
-
+async def safe_send(send_func, text: str, **kwargs):
+    """Markdown 파싱 실패 시 자동으로 plain text로 fallback 전송."""
     try:
-        if edit:
-            await update_or_message.edit_text(text, parse_mode="Markdown", reply_markup=reply_markup)
-        else:
-            await reply_fn(text, parse_mode="Markdown", reply_markup=reply_markup)
+        return await send_func(text, **kwargs)
     except Exception as e:
-        logger.warning("Markdown parse failed, fallback to plain: %s", e)
-        # 마크다운 특수문자 싹 제거 후 재전송
-        plain_text = text.replace('*', '').replace('_', '').replace('`', '').replace('[', '(').replace(']', ')')
-        try:
-            if edit:
-                await update_or_message.edit_text(plain_text, reply_markup=reply_markup)
-            else:
-                await reply_fn(plain_text, reply_markup=reply_markup)
-        except Exception as e2:
-            logger.exception("plain fallback also failed: %s", e2)
+        emsg = str(e)
+        if "parse" in emsg.lower() or "entity" in emsg.lower() or "markdown" in emsg.lower():
+            logger.warning("Markdown parse failed (%s), retrying as plain text", emsg)
+            kwargs.pop("parse_mode", None)
+            # 마크다운 특수문자 전부 제거한 평문
+            plain_text = text
+            for ch in ("*", "_", "`"):
+                plain_text = plain_text.replace(ch, "")
+            plain_text = plain_text.replace("\\[", "[").replace("\\]", "]")
+            plain_text = plain_text.replace("\\(", "(").replace("\\)", ")")
+            try:
+                return await send_func(plain_text, **kwargs)
+            except Exception as e2:
+                logger.exception("plain fallback also failed: %s", e2)
+                raise
+        else:
+            raise
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -429,6 +422,13 @@ def kb_main_menu(is_private: bool = True) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def kb_cancel_only() -> InlineKeyboardMarkup:
+    """입력 중단용 취소 버튼만 있는 키보드."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ 입력 취소", callback_data="flow_cancel")
+    ]])
+
+
 def is_private_chat(update: Update) -> bool:
     """개인 채팅(1:1) 여부 판별. 그룹/수퍼그룹/채널은 False."""
     try:
@@ -590,9 +590,9 @@ HELP_TEXT_2 = (
     "   • 화요일 18시 이후 → 이번 주 일요일 주차로 전환\n"
     "   • 따라서 화요일 저녁 명단 업로드가 바로 다음 주일에 반영\n\n"
     "🔹 *연속결석 횟수*\n"
-    "   • 명단 CSV 업로드 시 이번 주 결석 1회가 자동 +1\n"
-    "   • 같은 주차 재업로드는 *중복 누적 방지* (멱등 처리)\n"
-    "   • 부서별로 나눠 올려도 각 부서당 1회만 +1\n\n"
+    "   • 업로드된 CSV의 *연속결석 값이 그대로 저장*됩니다\n"
+    "   • 자동 +1 처리는 *비활성화* 되어 있음 (CSV 값 신뢰)\n"
+    "   • 같은 주차 재업로드 시 *기존 심방기록 완전 보존*\n\n"
     "🔹 *구역 이름 정규화*\n"
     "   • `2-1` ↔ `2팀1` 은 내부적으로 동일 처리\n"
     "   • 공백·밑줄도 자동 정리\n\n"
@@ -615,8 +615,9 @@ HELP_TEXT_2 = (
     "   → 대상을 이 방에서 '등록' 단계까지 완료했는지 확인\n"
     f"   → 매주 화요일 {WEEKLY_REMINDER_HOUR:02d}:{WEEKLY_REMINDER_MIN:02d} KST 발송\n"
     "   → `/weektest` 로 즉시 실행 테스트\n\n"
-    "❓ *연속결석 숫자가 너무 많아요 (+2, +3 누적)*\n"
-    "   → 관리자에게 `reset_consec_increment_log` 실행 요청\n\n"
+    "❓ *연속결석 숫자가 이상해요*\n"
+    "   → CSV 업로드 값이 그대로 DB에 저장됩니다 (자동 +1 없음)\n"
+    "   → 이상하면 CSV를 수정하여 재업로드 (기존 심방기록 유지됨)\n\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
     "🌐 *상세 현황·분석·CSV·교회 비교 등은 웹 대시보드에서.*\n"
     "💬 문제가 있으면 `/diagnose` 결과 스크린샷을 관리자에게 전달해주세요.\n"
@@ -780,6 +781,13 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "cancel_save":
             await clear_tmp(chat_id)
             await q.message.reply_text("🚫 저장이 취소되었습니다.\n/menu")
+        elif data == "flow_cancel":
+            # 입력 흐름 전체 취소 (지역/구역 대기, 8단계 입력, 특별관리 3/4번 입력)
+            await clear_tmp(chat_id)
+            await q.message.reply_text(
+                "🚫 입력이 취소되었습니다.",
+                reply_markup=kb_main_menu(is_private_chat(update)),
+            )
 
         # ── 특별관리 흐름 ──
         elif data.startswith("sp_ch:"):
@@ -881,12 +889,12 @@ async def _on_abs_dept(update: Update, chat_id: int, church: str, dept: str):
         f"✅ {md(church)} / {md(dept)} / `{md(week_label)}`\n\n"
         f"③ *지역 또는 구역명*을 입력하세요 👇\n\n"
         f"• 지역 예) `강북`, `강남`, `강서`, `강동`, `노원`\n"
-        f"• 구역 예) `2-1` 또는 `2팀1` (둘 다 동일)\n\n"
-        f"_취소하려면 /cancel_"
+        f"• 구역 예) `2-1` 또는 `2팀1` (둘 다 동일)"
     )
     await q.edit_message_text(txt, parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("◀ 부서 다시 선택", callback_data=f"abs_ch:{church}")]
+            [InlineKeyboardButton("◀ 부서 다시 선택", callback_data=f"abs_ch:{church}")],
+            [InlineKeyboardButton("❌ 입력 취소", callback_data="flow_cancel")],
         ]))
 
 
@@ -1140,7 +1148,10 @@ async def _next_step(update, chat_id: int, current_idx: int, ctx: dict):
             reply_markup=InlineKeyboardMarkup(buttons),
         )
     else:
-        await update.message.reply_text(f"{step_num}️⃣ {label}\n입력해주세요:")
+        await update.message.reply_text(
+            f"{step_num}️⃣ {label}\n입력해주세요:",
+            reply_markup=kb_cancel_only()
+        )
 
 
 async def _show_confirm(update, chat_id: int, ctx: dict):
@@ -1591,6 +1602,25 @@ MINIAPP_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mi
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # 🛡 글로벌 에러 핸들러 — Markdown 파싱 실패 자동 감지/재시도
+    async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        err = context.error
+        logger.error("Global error: %s", err, exc_info=True)
+        emsg = str(err)
+        if ("parse" in emsg.lower() or "entity" in emsg.lower()) and isinstance(update, Update):
+            # 사용자에게는 간단한 안내만
+            try:
+                chat = update.effective_chat
+                if chat:
+                    await context.bot.send_message(
+                        chat_id=chat.id,
+                        text=f"⚠️ 일부 특수문자 때문에 표시에 문제가 있었습니다. /menu 로 돌아가세요."
+                    )
+            except Exception:
+                pass
+
+    app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start",    start_command))
     app.add_handler(CommandHandler("menu",     menu_command))
