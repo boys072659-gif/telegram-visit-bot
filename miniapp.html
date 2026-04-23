@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>결석자 심방 기록</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root{
+    --primary: #2563eb;
+    --danger:  #dc2626;
+    --success: #16a34a;
+    --warn:    #ea580c;
+    --text:    #0f172a;
+    --muted:   #64748b;
+    --border:  #e2e8f0;
+    --bg:      #ffffff;
+    --surface: #f8fafc;
+  }
+  *{ box-sizing: border-box; }
+  body{
+    margin: 0;
+    padding: 14px 14px 40px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
+    background: var(--tg-theme-bg-color, var(--bg));
+    color: var(--tg-theme-text-color, var(--text));
+    -webkit-tap-highlight-color: transparent;
+    font-size: 15px;
+  }
+  h1{ margin: 0 0 6px; font-size: 20px; font-weight: 900; letter-spacing: -0.3px; }
+  .sub{ color: var(--muted); font-size: 12.5px; margin-bottom: 16px; line-height: 1.5; }
+  .section{
+    border: 1.5px solid var(--border);
+    border-radius: 14px;
+    padding: 14px;
+    margin-bottom: 14px;
+    background: var(--surface);
+  }
+  .section-title{
+    font-size: 14px; font-weight: 900; margin-bottom: 12px;
+    color: var(--text); display: flex; align-items: center; gap: 6px;
+  }
+  .section-title .pill{
+    font-size: 10px; padding: 2px 6px;
+    background: var(--primary); color: #fff;
+    border-radius: 10px; font-weight: 800;
+  }
+  .form-group{ margin-bottom: 12px; }
+  label{ display: block; font-size: 12.5px; font-weight: 800; margin-bottom: 5px; color: var(--text); }
+  label .required{ color: var(--danger); margin-left: 2px; }
+  input, select, textarea{
+    width: 100%; padding: 11px 13px;
+    border: 1.5px solid var(--border); border-radius: 11px;
+    font-size: 14.5px; font-family: inherit;
+    background: #fff; color: var(--text);
+    transition: border-color .15s;
+  }
+  input:focus, select:focus, textarea:focus{
+    outline: none; border-color: var(--primary);
+  }
+  textarea{ min-height: 65px; resize: vertical; }
+  .help{ font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+  .chip-group{ display: flex; flex-wrap: wrap; gap: 5px; }
+  .chip{
+    padding: 7px 12px; border: 1.5px solid var(--border);
+    border-radius: 18px; background: #fff;
+    font-size: 12.5px; font-weight: 700; cursor: pointer;
+    transition: all .15s; user-select: none;
+  }
+  .chip.active{ background: var(--primary); color: #fff; border-color: var(--primary); }
+  .chip-yn.active[data-value="타겟"],
+  .chip-yn.active[data-value="완료"],
+  .chip-yn.active[data-value="확정"],
+  .chip-yn.active[data-value="참석"]{ background: var(--success); border-color: var(--success); }
+  .chip-yn.active[data-value="불참"],
+  .chip-yn.active[data-value="미완료"]{ background: var(--danger); border-color: var(--danger); }
+  .chip-yn.active[data-value="미타겟"],
+  .chip-yn.active[data-value="미정"]{ background: var(--warn); border-color: var(--warn); }
+
+  .inline-row{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+  .btn-main{
+    width: 100%; padding: 14px;
+    background: var(--primary); color: #fff;
+    border: none; border-radius: 14px;
+    font-size: 15px; font-weight: 900; cursor: pointer;
+    margin-top: 4px; transition: background .15s;
+  }
+  .btn-main:disabled{ background: var(--muted); opacity: 0.6; }
+  .btn-main:active{ background: #1d4ed8; }
+  .btn-secondary{
+    width: 100%; padding: 11px;
+    background: #fff; color: var(--primary);
+    border: 1.5px solid var(--primary); border-radius: 14px;
+    font-size: 13.5px; font-weight: 800; cursor: pointer;
+    margin-top: 6px;
+  }
+
+  .status{
+    margin-top: 12px; padding: 11px 14px;
+    border-radius: 11px; display: none;
+    font-size: 13px; font-weight: 700;
+    white-space: pre-line;
+  }
+  .status.success{ display:block; background:#dcfce7; color:#166534; border:1px solid #86efac; }
+  .status.error{ display:block; background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
+  .status.info{ display:block; background:#dbeafe; color:#1e40af; border:1px solid #93c5fd; }
+  .status.loading{ display:block; background:#f1f5f9; color:#334155; border:1px solid #cbd5e1; }
+
+  .found-card{
+    background: #f0f9ff; border: 1.5px solid #93c5fd;
+    border-radius: 11px; padding: 11px 13px;
+    margin-bottom: 10px; font-size: 13px;
+  }
+  .found-card strong{ color: #1e40af; font-size: 14.5px; }
+  .found-card .tag-streak{
+    display: inline-block; background: #fef3c7; color: #92400e;
+    padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 800; margin-left: 4px;
+  }
+  .found-card .tag-done{
+    display: inline-block; background: #dcfce7; color: #166534;
+    padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 800; margin-left: 4px;
+  }
+
+  #step2 { display: none; }
+  #step2.visible { display: block; }
+</style>
+</head>
+<body>
+
+<h1>📋 결석자 심방 기록</h1>
+<p class="sub">
+  ① 결석자 검색 → ② 심방 내용 기록<br>
+  <strong>이전에 저장한 기록이 있으면 자동으로 불러옵니다.</strong><br>
+  부족한 내용만 보충하거나 수정 후 저장하면 됩니다.
+</p>
+
+<!-- ═══ STEP 1: 결석자 검색 ═══ -->
+<div class="section" id="step1">
+  <div class="section-title"><span class="pill">STEP 1</span> 결석자 검색</div>
+
+  <div class="form-group">
+    <label>이름 <span class="required">*</span></label>
+    <input type="text" id="q_name" placeholder="예: 홍길동" maxlength="30" autocomplete="off">
+  </div>
+
+  <div class="form-group">
+    <label>전화번호 뒷 4자리 <span class="required">*</span></label>
+    <input type="tel" id="q_phone" placeholder="0000" inputmode="numeric" maxlength="4">
+    <div class="help">동명이인 구분용. 숫자 4자리</div>
+  </div>
+
+  <div class="form-group">
+    <label>교회 <span class="required">*</span></label>
+    <div class="chip-group" id="q_church_chips"></div>
+  </div>
+
+  <div class="form-group">
+    <label>부서 <span class="required">*</span></label>
+    <div class="chip-group" id="q_dept_chips"></div>
+  </div>
+
+  <button type="button" class="btn-main" onclick="searchAbsentee()">🔍 결석자 찾기</button>
+  <div class="status" id="search_status"></div>
+</div>
+
+
+<!-- ═══ STEP 2: 심방 기록 입력 ═══ -->
+<div class="section" id="step2">
+  <div class="section-title"><span class="pill">STEP 2</span> 심방 기록 입력</div>
+
+  <div id="found_display"></div>
+
+  <div class="inline-row">
+    <div class="form-group">
+      <label>지역</label>
+      <input type="text" id="f_region" placeholder="예: 강북" maxlength="20">
+    </div>
+    <div class="form-group">
+      <label>구역</label>
+      <input type="text" id="f_zone" placeholder="예: 2-1 또는 2팀1" maxlength="20">
+    </div>
+  </div>
+
+  <div class="form-group">
+    <label>1️⃣ 심방자</label>
+    <input type="text" id="f_shepherd" placeholder="예: 홍길동(집사)" maxlength="50">
+  </div>
+
+  <div class="form-group">
+    <label>2️⃣ 심방날짜</label>
+    <input type="text" id="f_date" placeholder="예: 4/27 또는 2026-04-27" maxlength="20">
+    <div class="help">자유 형식 입력 가능</div>
+  </div>
+
+  <div class="form-group">
+    <label>3️⃣ 심방계획</label>
+    <textarea id="f_plan" placeholder="심방 계획"></textarea>
+  </div>
+
+  <div class="form-group">
+    <label>4️⃣ 타겟여부</label>
+    <div class="chip-group" id="f_target_chips">
+      <div class="chip chip-yn" data-value="타겟">🎯 타겟</div>
+      <div class="chip chip-yn" data-value="미타겟">미타겟</div>
+    </div>
+  </div>
+
+  <div class="form-group">
+    <label>5️⃣ 진행여부</label>
+    <div class="chip-group" id="f_done_chips">
+      <div class="chip chip-yn" data-value="완료">✅ 완료</div>
+      <div class="chip chip-yn" data-value="미완료">미완료</div>
+    </div>
+  </div>
+
+  <div class="form-group">
+    <label>6️⃣ 예배확답</label>
+    <div class="chip-group" id="f_worship_chips">
+      <div class="chip chip-yn" data-value="확정">확정</div>
+      <div class="chip chip-yn" data-value="미정">미정</div>
+      <div class="chip chip-yn" data-value="불참">불참</div>
+    </div>
+  </div>
+
+  <div class="form-group">
+    <label>7️⃣ 진행사항</label>
+    <textarea id="f_note" placeholder="진행사항 (없으면 '없음')"></textarea>
+  </div>
+
+  <div class="form-group">
+    <label>8️⃣ 예배참석</label>
+    <div class="chip-group" id="f_attendance_chips">
+      <div class="chip chip-yn" data-value="참석">⛪ 참석</div>
+      <div class="chip chip-yn" data-value="불참">불참</div>
+    </div>
+  </div>
+
+  <button type="button" class="btn-main" onclick="saveProgress()">💾 저장하기</button>
+  <button type="button" class="btn-secondary" onclick="backToSearch()">← 다른 결석자 찾기</button>
+  <div class="status" id="save_status"></div>
+</div>
+
+
+<script>
+  const tg = window.Telegram && window.Telegram.WebApp;
+  if(tg){ tg.ready(); tg.expand(); }
+
+  const CHURCHES = ["서울교회", "포천교회", "구리교회", "동대문교회", "의정부교회"];
+  const DEPTS    = ["자문회", "장년회", "부녀회", "청년회"];
+
+  let selectedChurch = "";
+  let selectedDept = "";
+  let currentTarget = null;
+  let currentProgress = null;
+
+  function renderChipGroup(mountId, values, onSelect){
+    const mount = document.getElementById(mountId);
+    mount.innerHTML = '';
+    values.forEach(v => {
+      const el = document.createElement('div');
+      el.className = 'chip';
+      el.dataset.value = v;
+      el.textContent = v;
+      el.onclick = () => {
+        mount.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+        el.classList.add('active');
+        if(onSelect) onSelect(v);
+      };
+      mount.appendChild(el);
+    });
+  }
+
+  function setChipValue(mountId, value){
+    const mount = document.getElementById(mountId);
+    mount.querySelectorAll('.chip').forEach(c => {
+      c.classList.toggle('active', c.dataset.value === value);
+    });
+  }
+  function getChipValue(mountId){
+    const active = document.querySelector(`#${mountId} .chip.active`);
+    return active ? active.dataset.value : '';
+  }
+
+  renderChipGroup('q_church_chips', CHURCHES, v => selectedChurch = v);
+  renderChipGroup('q_dept_chips',   DEPTS,    v => selectedDept = v);
+
+  ['f_target_chips','f_done_chips','f_worship_chips','f_attendance_chips'].forEach(id => {
+    const mount = document.getElementById(id);
+    mount.querySelectorAll('.chip').forEach(el => {
+      el.onclick = () => {
+        mount.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+        el.classList.add('active');
+      };
+    });
+  });
+
+  document.getElementById('q_phone').addEventListener('input', (e) => {
+    e.target.value = e.target.value.replace(/[^0-9]/g, '').slice(0, 4);
+  });
+
+  function showStatus(elId, msg, type){
+    const el = document.getElementById(elId);
+    el.textContent = msg;
+    el.className = 'status ' + type;
+  }
+  function hideStatus(elId){
+    const el = document.getElementById(elId);
+    el.style.display = 'none';
+  }
+
+  async function searchAbsentee(){
+    hideStatus('search_status');
+    const name = document.getElementById('q_name').value.trim();
+    const phone = document.getElementById('q_phone').value.trim();
+
+    if(!name){ showStatus('search_status', '❌ 이름을 입력해주세요', 'error'); return; }
+    if(!/^\d{4}$/.test(phone)){ showStatus('search_status', '❌ 전화번호 뒷 4자리를 정확히 입력', 'error'); return; }
+    if(!selectedChurch){ showStatus('search_status', '❌ 교회를 선택해주세요', 'error'); return; }
+    if(!selectedDept){ showStatus('search_status', '❌ 부서를 선택해주세요', 'error'); return; }
+
+    showStatus('search_status', '🔍 검색 중...', 'loading');
+    try{
+      const params = new URLSearchParams({ name, phone, church: selectedChurch, dept: selectedDept });
+      const resp = await fetch('/miniapp/search?' + params.toString());
+      const j = await resp.json();
+
+      if(!j.ok){
+        showStatus('search_status', '❌ ' + (j.error || '검색 실패'), 'error');
+        return;
+      }
+      if(!j.target){
+        showStatus('search_status',
+          `📭 ${selectedChurch} ${selectedDept} 결석자 명단에 "${name}(${phone})" 없습니다.\n대시보드에서 이번 주차 명단이 업로드됐는지 확인하세요.`,
+          'error');
+        return;
+      }
+
+      currentTarget = j.target;
+      currentProgress = j.progress || null;
+      fillStep2();
+      document.getElementById('step1').style.display = 'none';
+      document.getElementById('step2').classList.add('visible');
+      hideStatus('search_status');
+      window.scrollTo(0, 0);
+    }catch(err){
+      showStatus('search_status', '❌ ' + err.message, 'error');
+    }
+  }
+
+  function fillStep2(){
+    const t = currentTarget;
+    const p = currentProgress;
+    const streak = Number(t.consecutive_absent_count || 0);
+    const hasProgress = !!p;
+
+    const header = `
+      <div class="found-card">
+        <strong>${escapeHtml(t.name)}</strong> (${escapeHtml(t.phone_last4 || '')})
+        <span class="tag-streak">연속 ${streak}회</span>
+        ${hasProgress ? '<span class="tag-done">📝 기존 기록 있음 (불러옴)</span>' : ''}
+        <br>
+        <span style="color:#475569;font-size:12px">
+          ${escapeHtml(t.church || '')} / ${escapeHtml(t.dept || '')}
+          / 주차: ${escapeHtml(t.week_key || '')}
+        </span>
+      </div>
+    `;
+    document.getElementById('found_display').innerHTML = header;
+
+    document.getElementById('f_region').value = t.region_name || '';
+    document.getElementById('f_zone').value   = t.zone_name   || '';
+
+    document.getElementById('f_shepherd').value = (p && p.shepherd) || '';
+    document.getElementById('f_date').value     = (p && p.visit_date_display) || '';
+    document.getElementById('f_plan').value     = (p && p.plan_text) || '';
+    document.getElementById('f_note').value     = (p && p.note) || '';
+
+    // 기존값 복원 (빈 progress면 아무것도 선택 안 함)
+    if(p){
+      setChipValue('f_target_chips',  p.is_target ? '타겟' : '미타겟');
+      setChipValue('f_done_chips',    p.is_done   ? '완료' : '미완료');
+    } else {
+      setChipValue('f_target_chips',  '');
+      setChipValue('f_done_chips',    '');
+    }
+    setChipValue('f_worship_chips',    (p && p.worship) || '');
+    setChipValue('f_attendance_chips', (p && p.attendance) || '');
+
+    hideStatus('save_status');
+  }
+
+  function backToSearch(){
+    document.getElementById('step1').style.display = '';
+    document.getElementById('step2').classList.remove('visible');
+    currentTarget = null;
+    currentProgress = null;
+    hideStatus('save_status');
+    // 검색 폼 유지 (이름/전화만 지움, 교회/부서는 유지)
+    document.getElementById('q_name').value = '';
+    document.getElementById('q_phone').value = '';
+    document.getElementById('q_name').focus();
+    window.scrollTo(0, 0);
+  }
+
+  async function saveProgress(){
+    hideStatus('save_status');
+    if(!currentTarget){ showStatus('save_status', '❌ 결석자를 먼저 선택해주세요', 'error'); return; }
+
+    const payload = {
+      week_key: currentTarget.week_key,
+      row_id:   currentTarget.row_id,
+      region_name: document.getElementById('f_region').value.trim(),
+      zone_name:   document.getElementById('f_zone').value.trim(),
+      shepherd:    document.getElementById('f_shepherd').value.trim(),
+      visit_date_display: document.getElementById('f_date').value.trim(),
+      plan_text:   document.getElementById('f_plan').value.trim(),
+      note:        document.getElementById('f_note').value.trim(),
+      target:      getChipValue('f_target_chips'),
+      done:        getChipValue('f_done_chips'),
+      worship:     getChipValue('f_worship_chips'),
+      attendance:  getChipValue('f_attendance_chips'),
+    };
+
+    showStatus('save_status', '💾 저장 중...', 'loading');
+    try{
+      const resp = await fetch('/miniapp/submit', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+      });
+      const j = await resp.json();
+      if(j.ok){
+        showStatus('save_status', `✅ ${currentTarget.name} 님 심방 기록이 저장되었습니다.`, 'success');
+        if(tg && tg.sendData){
+          tg.sendData(JSON.stringify({
+            action: 'progress_saved',
+            name: currentTarget.name,
+            church: currentTarget.church,
+            dept: currentTarget.dept,
+          }));
+        }
+        setTimeout(() => {
+          if(tg && tg.close) tg.close();
+          else backToSearch();
+        }, 1500);
+      }else{
+        showStatus('save_status', '❌ ' + (j.error || '저장 실패'), 'error');
+      }
+    }catch(err){
+      showStatus('save_status', '❌ ' + err.message, 'error');
+    }
+  }
+
+  function escapeHtml(s){
+    if(s == null) return '';
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
+  }
+</script>
+
+</body>
+</html>
