@@ -430,10 +430,10 @@ HELP_TEXT_1 = (
     "*1️⃣ 기본 명령어*\n"
     "• `/start` — 메인 메뉴 + 하단 키보드 + 전체 사용법\n"
     "• `/menu` — 메인 메뉴 다시 열기\n"
-    "• `/도움말` 또는 `/help` — 이 안내\n"
-    "• `/취소` 또는 `/cancel` — 현재 입력 흐름 중단\n"
-    "• `/db진단` — DB 연결 / 주차 / 결석자 데이터 확인\n"
-    "• `/주간알림테스트` — 주간 리마인더 즉시 실행 (테스트용)\n\n"
+    "• `/help` — 이 안내 (도움말)\n"
+    "• `/cancel` — 현재 입력 흐름 중단\n"
+    "• `/diagnose` — DB 연결 / 주차 / 결석자 데이터 확인\n"
+    "• `/weektest` — 주간 리마인더 즉시 실행 (테스트용)\n\n"
 
     "*2️⃣ 하단 키보드 (⌨️) 사용법*\n"
     "메시지 입력창 오른쪽의 *⌨️ 키보드 아이콘*을 탭하면 하단에 고정 버튼이 펼쳐집니다.\n"
@@ -550,7 +550,7 @@ HELP_TEXT_2 = (
     "❓ *'결석자가 없습니다' 라고 나와요*\n"
     "   → 지역/구역 이름 철자 확인 (봇이 자동으로 사용 가능한 이름 목록 보여줌)\n"
     "   → 웹에서 이번 주차 명단이 업로드됐는지 확인\n"
-    "   → `/db진단` 으로 DB 상태 확인\n\n"
+    "   → `/diagnose` 으로 DB 상태 확인\n\n"
     "❓ *'세션 만료'라고 나와요*\n"
     "   → `/menu` 입력해서 처음부터 다시 시작\n\n"
     "❓ *하단 키보드가 사라졌어요*\n"
@@ -560,12 +560,12 @@ HELP_TEXT_2 = (
     "❓ *특별관리 리마인더가 안 와요*\n"
     "   → 대상을 이 방에서 '등록' 단계까지 완료했는지 확인\n"
     f"   → 매주 화요일 {WEEKLY_REMINDER_HOUR:02d}:{WEEKLY_REMINDER_MIN:02d} KST 발송\n"
-    "   → `/주간알림테스트` 로 즉시 실행 테스트\n\n"
+    "   → `/weektest` 로 즉시 실행 테스트\n\n"
     "❓ *연속결석 숫자가 너무 많아요 (+2, +3 누적)*\n"
     "   → 관리자에게 `reset_consec_increment_log` 실행 요청\n\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
     "🌐 *상세 현황·분석·CSV·교회 비교 등은 웹 대시보드에서.*\n"
-    "💬 문제가 있으면 `/db진단` 결과 스크린샷을 관리자에게 전달해주세요.\n"
+    "💬 문제가 있으면 `/diagnose` 결과 스크린샷을 관리자에게 전달해주세요.\n"
 )
 
 # 하위 호환용 (기존 코드에서 HELP_TEXT 참조하는 곳)
@@ -600,7 +600,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🏠 *메인 메뉴*\n\n"
         f"📅 현재 주차: *{md(week_label) if week_label else '미등록'}*\n"
         "아래 버튼에서 원하는 기능을 선택하세요 👇\n\n"
-        "💡 사용법은 *❓ 사용법* 버튼 또는 `/도움말`"
+        "💡 사용법은 *❓ 사용법* 버튼 또는 `/help`"
     )
     await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb_main_menu())
     # 리플라이 키보드가 사라져있을 수 있으니 복구
@@ -826,7 +826,7 @@ async def _on_abs_dept(update: Update, chat_id: int, church: str, dept: str):
         f"③ *지역 또는 구역명*을 입력하세요 👇\n\n"
         f"• 지역 예) `강북`, `강남`, `강서`, `강동`, `노원`\n"
         f"• 구역 예) `2-1` 또는 `2팀1` (둘 다 동일)\n\n"
-        f"_취소하려면 /취소_"
+        f"_취소하려면 /cancel_"
     )
     await q.edit_message_text(txt, parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
@@ -1029,7 +1029,7 @@ async def _on_abs_select(update: Update, chat_id: int, row_id: str):
     await q.message.reply_text(
         f"✏️ *{md(name)}* 님 심방 기록 시작{existing}\n\n"
         f"1️⃣ {STEP_LABELS['shepherd']}\n입력해주세요:\n\n"
-        f"_중단하려면 /취소_",
+        f"_중단하려면 /cancel_",
         parse_mode="Markdown",
     )
 
@@ -1345,7 +1345,7 @@ async def _on_sp_edit_text(update: Update, chat_id: int, church: str, dept: str,
     label = "금주 심방예정일" if which == "3" else "금주 심방계획"
     await q.message.reply_text(
         f"✏️ *{md(name)}* 님의 *{label}* 을 입력해주세요:\n\n"
-        f"_취소하려면 /취소_",
+        f"_취소하려면 /cancel_",
         parse_mode="Markdown",
     )
 
@@ -1448,13 +1448,10 @@ def main():
 
     app.add_handler(CommandHandler("start",    start_command))
     app.add_handler(CommandHandler("menu",     menu_command))
-    app.add_handler(CommandHandler("도움말",   help_command))
     app.add_handler(CommandHandler("help",     help_command))
-    app.add_handler(CommandHandler("취소",     cancel_command))
     app.add_handler(CommandHandler("cancel",   cancel_command))
-    app.add_handler(CommandHandler("db진단",   diagnose_command))
     app.add_handler(CommandHandler("diagnose", diagnose_command))
-    app.add_handler(CommandHandler("주간알림테스트", force_weekly_command))
+    app.add_handler(CommandHandler("weektest", force_weekly_command))
 
     app.add_handler(CallbackQueryHandler(button_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
