@@ -83,10 +83,50 @@ SP_ITEM_LABELS = {
 }
 
 # ── 마크다운 이스케이프 ────────────────────────────────────────────────────────
+# Telegram legacy Markdown v1: _ * ` [ 만 특수. 하지만 닫히지 않으면 파서 에러.
+# 모든 *, _, `, [ 를 이스케이프
 _MD_SPECIALS = "_*`["
 def md(s) -> str:
     if s is None: return ""
     return "".join(("\\" + c) if c in _MD_SPECIALS else c for c in str(s))
+
+def plain(s) -> str:
+    """마크다운 없이 사용할 때 - 그냥 반환"""
+    if s is None: return ""
+    return str(s)
+
+
+async def safe_reply(update_or_message, text: str, reply_markup=None, edit=False):
+    """
+    마크다운 파싱 에러(특수문자 포함 이름 등) 발생 시 자동으로
+    마크다운 없이 재시도하는 안전 래퍼.
+    """
+    # update 객체인지 message 객체인지 판별
+    if hasattr(update_or_message, 'reply_text'):
+        target = update_or_message
+        reply_fn = target.reply_text
+    elif hasattr(update_or_message, 'message') and update_or_message.message:
+        reply_fn = update_or_message.message.reply_text
+    else:
+        # callback_query.message
+        reply_fn = update_or_message.reply_text
+
+    try:
+        if edit:
+            await update_or_message.edit_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+        else:
+            await reply_fn(text, parse_mode="Markdown", reply_markup=reply_markup)
+    except Exception as e:
+        logger.warning("Markdown parse failed, fallback to plain: %s", e)
+        # 마크다운 특수문자 싹 제거 후 재전송
+        plain_text = text.replace('*', '').replace('_', '').replace('`', '').replace('[', '(').replace(']', ')')
+        try:
+            if edit:
+                await update_or_message.edit_text(plain_text, reply_markup=reply_markup)
+            else:
+                await reply_fn(plain_text, reply_markup=reply_markup)
+        except Exception as e2:
+            logger.exception("plain fallback also failed: %s", e2)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -347,13 +387,16 @@ if not MINIAPP_URL:
         MINIAPP_URL = _webhook.rsplit("/", 1)[0] + "/miniapp"
 
 
-def kb_reply_main() -> ReplyKeyboardMarkup:
-    """하단에 고정되는 리플라이 키보드. 키보드 아이콘(⌨️) 탭하면 이 버튼들이 나옴."""
+def kb_reply_main(is_private: bool = True) -> ReplyKeyboardMarkup:
+    """하단에 고정되는 리플라이 키보드. 키보드 아이콘(⌨️) 탭하면 이 버튼들이 나옴.
+    
+    ⚠️ 웹앱 버튼은 1:1 개인 채팅에서만 작동. 그룹에서는 제외.
+    """
     rows = [
         [KeyboardButton("📋 결석자 심방"), KeyboardButton("🚨 특별관리결석자")],
     ]
-    # 미니웹앱 URL이 있으면 웹앱 버튼 추가 (HTTPS 필수)
-    if MINIAPP_URL.startswith("https://"):
+    # 웹앱 버튼은 개인 채팅에서만 추가 (그룹에서는 "Web app buttons can be used in private chats only" 에러 발생)
+    if is_private and MINIAPP_URL.startswith("https://"):
         rows.append([KeyboardButton(
             "📝 결석자 심방 기록 (폼)",
             web_app=WebAppInfo(url=MINIAPP_URL)
@@ -367,12 +410,14 @@ def kb_reply_main() -> ReplyKeyboardMarkup:
     )
 
 
-def kb_main_menu() -> InlineKeyboardMarkup:
+def kb_main_menu(is_private: bool = True) -> InlineKeyboardMarkup:
+    """인라인 메인 메뉴. 웹앱 버튼은 개인 채팅에서만."""
     rows = [
         [InlineKeyboardButton("📋 결석자 심방",       callback_data="m:absentee")],
         [InlineKeyboardButton("🚨 특별관리결석자",    callback_data="m:special")],
     ]
-    if MINIAPP_URL.startswith("https://"):
+    # 웹앱 버튼은 개인 채팅에서만
+    if is_private and MINIAPP_URL.startswith("https://"):
         rows.append([InlineKeyboardButton(
             "📝 결석자 심방 기록 (미니웹앱)",
             web_app=WebAppInfo(url=MINIAPP_URL)
@@ -382,6 +427,15 @@ def kb_main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔍 DB 진단",            callback_data="m:diagnose")],
     ]
     return InlineKeyboardMarkup(rows)
+
+
+def is_private_chat(update: Update) -> bool:
+    """개인 채팅(1:1) 여부 판별. 그룹/수퍼그룹/채널은 False."""
+    try:
+        chat = update.effective_chat
+        return chat is not None and chat.type == "private"
+    except Exception:
+        return True  # 알 수 없으면 안전하게 private으로
 
 def kb_church_select(flow: str) -> InlineKeyboardMarkup:
     """flow: 'abs' | 'sp'"""
@@ -574,7 +628,7 @@ HELP_TEXT = HELP_TEXT_1 + "\n\n" + HELP_TEXT_2
 async def _send_help(update: Update):
     """도움말을 2개 메시지로 나눠서 전송 (텔레그램 4096자 제한 대응)."""
     await update.message.reply_text(HELP_TEXT_1, parse_mode="Markdown")
-    await update.message.reply_text(HELP_TEXT_2, parse_mode="Markdown", reply_markup=kb_main_menu())
+    await update.message.reply_text(HELP_TEXT_2, parse_mode="Markdown", reply_markup=kb_main_menu(is_private_chat(update)))
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -589,7 +643,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         banner + "⌨️ 하단 키보드 아이콘을 탭하면 빠른 메뉴가 열립니다.\n"
                  "아래 버튼으로 시작하거나, 사용법을 먼저 확인하세요 👇",
         parse_mode="Markdown",
-        reply_markup=kb_reply_main(),
+        reply_markup=kb_reply_main(is_private_chat(update)),
     )
     # 2) 전체 사용법 (2개로 분할 전송)
     await _send_help(update)
@@ -602,9 +656,9 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "아래 버튼에서 원하는 기능을 선택하세요 👇\n\n"
         "💡 사용법은 *❓ 사용법* 버튼 또는 `/help`"
     )
-    await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb_main_menu())
+    await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb_main_menu(is_private_chat(update)))
     # 리플라이 키보드가 사라져있을 수 있으니 복구
-    await update.message.reply_text("⌨️ 하단 키보드 메뉴 활성화", reply_markup=kb_reply_main())
+    await update.message.reply_text("⌨️ 하단 키보드 메뉴 활성화", reply_markup=kb_reply_main(is_private_chat(update)))
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_help(update)
@@ -676,7 +730,7 @@ async def diagnose_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"   ✅ `{fn}` (존재)")
 
     await update.message.reply_text(
-        "\n".join(lines), parse_mode="Markdown", reply_markup=kb_main_menu()
+        "\n".join(lines), parse_mode="Markdown", reply_markup=kb_main_menu(is_private_chat(update))
     )
 
 
@@ -700,7 +754,7 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "m:help":
             # 사용법은 길어서 2개로 분할 전송. edit_message는 덮어쓰므로 새 메시지로 전송.
             await q.message.reply_text(HELP_TEXT_1, parse_mode="Markdown")
-            await q.message.reply_text(HELP_TEXT_2, parse_mode="Markdown", reply_markup=kb_main_menu())
+            await q.message.reply_text(HELP_TEXT_2, parse_mode="Markdown", reply_markup=kb_main_menu(is_private_chat(update)))
         elif data == "m:diagnose":
             # 진단은 새 메시지로 전송 (긴 내용)
             class FakeUpd:
@@ -734,22 +788,24 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("sp_dp:"):
             _, church, dept = data.split(":", 2)
             await _on_sp_dept(update, chat_id, church, dept)
+        elif data.startswith("sp_pk:"):
+            # sp_pk:{row_id} - row_id 로부터 결석자 정보 조회
+            row_id = data.split(":", 1)[1]
+            await _on_sp_pick_by_rowid(update, chat_id, row_id)
+        elif data in ("sp_t1", "sp_t2"):
+            which = "1" if data == "sp_t1" else "2"
+            await _on_sp_toggle_ctx(update, chat_id, which)
+        elif data in ("sp_e3", "sp_e4"):
+            which = "3" if data == "sp_e3" else "4"
+            await _on_sp_edit_text_ctx(update, chat_id, which)
+        elif data == "sp_del":
+            await _on_sp_unregister_ctx(update, chat_id)
+        # 하위 호환 (구버전 callback data)
         elif data.startswith("sp_pick:"):
-            # sp_pick:{church}:{dept}:{name}:{phone}
             parts = data.split(":", 4)
-            _, church, dept, name, phone = parts
-            await _on_sp_pick(update, chat_id, church, dept, name, phone)
-        elif data.startswith("sp_t1:") or data.startswith("sp_t2:"):
-            which = "1" if data.startswith("sp_t1:") else "2"
-            _, church, dept, name, phone = data.split(":", 4)
-            await _on_sp_toggle(update, chat_id, church, dept, name, phone, which)
-        elif data.startswith("sp_e3:") or data.startswith("sp_e4:"):
-            which = "3" if data.startswith("sp_e3:") else "4"
-            _, church, dept, name, phone = data.split(":", 4)
-            await _on_sp_edit_text(update, chat_id, church, dept, name, phone, which)
-        elif data.startswith("sp_del:"):
-            _, church, dept, name, phone = data.split(":", 4)
-            await _on_sp_unregister(update, chat_id, church, dept, name, phone)
+            if len(parts) == 5:
+                _, church, dept, name, phone = parts
+                await _on_sp_pick(update, chat_id, church, dept, name, phone)
 
     except Exception as e:
         logger.exception("button_cb failed: %s", e)
@@ -767,7 +823,7 @@ async def _show_home(update: Update):
         f"📅 현재 주차: *{md(week_label) if week_label else '미등록'}*\n"
         "원하는 기능을 선택하세요 👇"
     )
-    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb_main_menu())
+    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb_main_menu(is_private_chat(update)))
 
 
 async def _show_church_select(update: Update, flow: str):
@@ -810,7 +866,7 @@ async def _on_abs_dept(update: Update, chat_id: int, church: str, dept: str):
     if not week_key:
         await q.edit_message_text(
             "❌ 등록된 주차가 없습니다.\n웹 대시보드에서 명단을 먼저 업로드해주세요.",
-            reply_markup=kb_main_menu(),
+            reply_markup=kb_main_menu(is_private_chat(update)),
         )
         return
 
@@ -858,6 +914,13 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await menu_command(update, context)
             return
         if text == "📝 결석자 심방 기록 (폼)":
+            if not is_private_chat(update):
+                await update.message.reply_text(
+                    "⚠️ 미니앱 폼은 *개인 채팅*에서만 열 수 있습니다.\n"
+                    "봇과 1:1 채팅을 시작한 다음 사용해주세요.",
+                    parse_mode="Markdown",
+                )
+                return
             if MINIAPP_URL.startswith("https://"):
                 await update.message.reply_text(
                     "📝 아래 버튼을 탭하면 결석자 심방 기록 폼이 열립니다.\n\n"
@@ -944,9 +1007,12 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await save_ctx(chat_id, editing_step="awaiting_region_or_zone")
             return
 
-        # 결석자 버튼 목록
+        # 결석자 버튼 목록 (텔레그램 reply_markup 크기 제한 대비 최대 40명)
+        MAX_BUTTONS = 40
+        shown = absentees[:MAX_BUTTONS]
+        overflow_abs = len(absentees) - MAX_BUTTONS
         buttons = []
-        for ab in absentees:
+        for ab in shown:
             name   = ab.get("name", "?")
             phone  = ab.get("phone_last4", "") or ""
             zone   = ab.get("zone_name", "") or ""
@@ -955,13 +1021,17 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 label = f"{name} · 연속{streak}회"
             else:
                 label = f"{name} {zone} · 연속{streak}회"
+            if len(label) > 60:
+                label = label[:57] + "..."
             buttons.append([InlineKeyboardButton(label, callback_data=f"abs_sel:{ab['row_id']}")])
         buttons.append([InlineKeyboardButton("◀ 메인 메뉴", callback_data="m:home")])
 
+        overflow_note = f"\n\n_(+ {overflow_abs}명은 화면 제한으로 생략 — 더 정확한 지역/구역명으로 다시 검색해주세요)_" if overflow_abs > 0 else ""
         await update.message.reply_text(
             f"📋 *{md(church)} / {md(dept)} / {query_kind}: {md(query_label)}*\n"
             f"주차: `{md(week_label)}` | 총 {len(absentees)}명\n\n"
-            f"심방 기록할 결석자를 선택하세요 👇",
+            f"심방 기록할 결석자를 선택하세요 👇"
+            f"{overflow_note}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
@@ -1142,7 +1212,7 @@ async def _on_sp_dept(update: Update, chat_id: int, church: str, dept: str):
     q = update.callback_query
     week_key, week_label = await get_active_week()
     if not week_key:
-        await q.edit_message_text("❌ 등록된 주차가 없습니다.", reply_markup=kb_main_menu())
+        await q.edit_message_text("❌ 등록된 주차가 없습니다.", reply_markup=kb_main_menu(is_private_chat(update)))
         return
 
     targets = await fetch_absentees_4plus(week_key, church, dept)
@@ -1168,23 +1238,33 @@ async def _on_sp_dept(update: Update, chat_id: int, church: str, dept: str):
     except Exception:
         registered_set = set()
 
+    # 🚨 Telegram reply_markup 총 크기 제한 (~4096 bytes) — 최대 30명까지만 표시
+    MAX_TARGETS = 30
+    targets_shown = targets[:MAX_TARGETS]
+    overflow = len(targets) - MAX_TARGETS
     buttons = []
-    for t in targets:
+    for t in targets_shown:
         name   = t.get("name", "?")
         phone  = t.get("phone_last4", "") or ""
         region = t.get("region_name", "") or ""
         zone   = t.get("zone_name", "") or ""
         streak = t.get("consecutive_absent_count", 0) or 0
+        row_id = t.get("row_id", "")
         is_reg = (name, phone) in registered_set
         mark = "🚨" if is_reg else "⚠️"
         label = f"{mark} {name} ({region} {zone}) · {streak}회"
+        # 버튼 텍스트는 64자 제한 (Telegram button label)
+        if len(label) > 60:
+            label = label[:57] + "..."
+        # callback_data는 64 byte 제한 — row_id만 전달 (나중에 DB에서 조회)
         buttons.append([InlineKeyboardButton(
             label,
-            callback_data=f"sp_pick:{church}:{dept}:{name}:{phone}"
+            callback_data=f"sp_pk:{row_id}"
         )])
     buttons.append([InlineKeyboardButton("◀ 부서 다시 선택", callback_data=f"sp_ch:{church}")])
     buttons.append([InlineKeyboardButton("◀ 메인 메뉴",       callback_data="m:home")])
 
+    overflow_note = f"\n\n_(+ {overflow}명은 화면 제한으로 생략 — 연속결석 순 상위 {MAX_TARGETS}명만 표시)_" if overflow > 0 else ""
     txt = (
         f"🚨 *{md(church)} / {md(dept)}* — 4회 이상 {len(targets)}명\n"
         f"주차: `{md(week_label)}`\n\n"
@@ -1192,6 +1272,7 @@ async def _on_sp_dept(update: Update, chat_id: int, church: str, dept: str):
         f"⚠️ = 아직 미등록\n\n"
         f"관리할 결석자를 선택하세요 👇\n"
         f"_(선택 시 이 방이 감지방으로 등록됩니다)_"
+        f"{overflow_note}"
     )
     await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -1234,7 +1315,13 @@ async def _on_sp_pick(update: Update, chat_id: int, church: str, dept: str, name
         f"미체크 항목 리마인더가 이 방으로 발송됩니다.",
         parse_mode="Markdown",
     )
-    await save_ctx(chat_id, church_filter=church, dept_filter=dept)
+    await save_ctx(
+        chat_id,
+        church_filter=church,
+        dept_filter=dept,
+        tmp_sp_name=name,
+        tmp_sp_phone=phone,
+    )
     await _show_sp_detail(update, chat_id, church, dept, name, phone, send_new=True)
 
 
@@ -1279,21 +1366,22 @@ async def _show_sp_detail(update, chat_id: int, church: str, dept: str, name: st
         f"📝 *4. 금주 심방계획:* {md(item4) if item4 else '_미입력_'}"
     )
 
+    # callback_data는 64 byte 제한 — 짧은 명령만, 실제 대상은 ctx에서 읽음
     buttons = [
         [InlineKeyboardButton(
             f"{'✅ 1번 체크됨 (탭:해제)' if item1 else '⬜️ 1번 체크 (대책방 초대완료)'}",
-            callback_data=f"sp_t1:{church}:{dept}:{name}:{phone}"
+            callback_data="sp_t1"
         )],
         [InlineKeyboardButton(
             f"{'✅ 2번 체크됨 (탭:해제)' if item2 else '⬜️ 2번 체크 (금주 피드백)'}",
-            callback_data=f"sp_t2:{church}:{dept}:{name}:{phone}"
+            callback_data="sp_t2"
         )],
         [InlineKeyboardButton("📅 3번 심방예정일 입력/수정",
-            callback_data=f"sp_e3:{church}:{dept}:{name}:{phone}")],
+            callback_data="sp_e3")],
         [InlineKeyboardButton("📝 4번 심방계획 입력/수정",
-            callback_data=f"sp_e4:{church}:{dept}:{name}:{phone}")],
+            callback_data="sp_e4")],
         [InlineKeyboardButton("🗑 특별관리 해제",
-            callback_data=f"sp_del:{church}:{dept}:{name}:{phone}")],
+            callback_data="sp_del")],
         [InlineKeyboardButton("◀ 메인 메뉴", callback_data="m:home")],
     ]
     kb = InlineKeyboardMarkup(buttons)
@@ -1362,8 +1450,66 @@ async def _on_sp_unregister(update: Update, chat_id: int, church: str, dept: str
     await q.edit_message_text(
         f"🗑 *{md(name)}* 님을 특별관리에서 해제했습니다.",
         parse_mode="Markdown",
-        reply_markup=kb_main_menu(),
+        reply_markup=kb_main_menu(is_private_chat(update)),
     )
+
+
+# ── row_id 기반 / 컨텍스트 기반 래퍼 (callback_data 64 byte 한도 대응) ────
+async def _on_sp_pick_by_rowid(update: Update, chat_id: int, row_id: str):
+    """row_id 로 결석자 조회 후 _on_sp_pick 호출"""
+    rows = await sb_get(
+        f"weekly_visit_targets?select=name,phone_last4,church,dept,region_name,zone_name"
+        f"&row_id=eq.{quote(row_id)}&limit=1"
+    )
+    if not rows:
+        q = update.callback_query
+        await q.message.reply_text("❌ 결석자 정보를 찾을 수 없습니다.\n/menu 로 돌아가세요.")
+        return
+    t = rows[0]
+    await _on_sp_pick(
+        update, chat_id,
+        t.get("church","") or "",
+        t.get("dept","") or "",
+        t.get("name","") or "",
+        t.get("phone_last4","") or "",
+    )
+
+async def _get_current_sp(chat_id: int):
+    """컨텍스트에서 현재 관리 중인 특별관리 대상 정보 추출"""
+    ctx = await get_ctx(chat_id)
+    if not ctx:
+        return None
+    name  = ctx.get("tmp_sp_name") or ""
+    phone = ctx.get("tmp_sp_phone") or ""
+    dept  = ctx.get("dept_filter") or ""
+    church = ctx.get("church_filter") or ""
+    if not (name and dept):
+        return None
+    return {"church": church, "dept": dept, "name": name, "phone": phone}
+
+async def _on_sp_toggle_ctx(update: Update, chat_id: int, which: str):
+    info = await _get_current_sp(chat_id)
+    if not info:
+        q = update.callback_query
+        await q.message.reply_text("❌ 세션 만료. /menu 로 다시 시작해주세요.")
+        return
+    await _on_sp_toggle(update, chat_id, info["church"], info["dept"], info["name"], info["phone"], which)
+
+async def _on_sp_edit_text_ctx(update: Update, chat_id: int, which: str):
+    info = await _get_current_sp(chat_id)
+    if not info:
+        q = update.callback_query
+        await q.message.reply_text("❌ 세션 만료. /menu 로 다시 시작해주세요.")
+        return
+    await _on_sp_edit_text(update, chat_id, info["church"], info["dept"], info["name"], info["phone"], which)
+
+async def _on_sp_unregister_ctx(update: Update, chat_id: int):
+    info = await _get_current_sp(chat_id)
+    if not info:
+        q = update.callback_query
+        await q.message.reply_text("❌ 세션 만료. /menu 로 다시 시작해주세요.")
+        return
+    await _on_sp_unregister(update, chat_id, info["church"], info["dept"], info["name"], info["phone"])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
