@@ -518,7 +518,7 @@ def kb_reply_main(is_private: bool = True) -> ReplyKeyboardMarkup:
             "📝 결석자 심방 기록 (폼)",
             web_app=WebAppInfo(url=MINIAPP_URL)
         )])
-    rows.append([KeyboardButton("❓ 사용법"), KeyboardButton("🏠 메인 메뉴")])
+    rows.append([KeyboardButton("📘 사용법"), KeyboardButton("🏠 메인 메뉴")])
     return ReplyKeyboardMarkup(
         rows,
         resize_keyboard=True,
@@ -540,7 +540,7 @@ def kb_main_menu(is_private: bool = True) -> InlineKeyboardMarkup:
             web_app=WebAppInfo(url=MINIAPP_URL)
         )])
     rows += [
-        [InlineKeyboardButton("❓ 사용법 (도움말)",    callback_data="m:help")],
+        [InlineKeyboardButton("📘 사용법 (도움말)",    callback_data="m:help")],
         [InlineKeyboardButton("🔍 DB 진단",            callback_data="m:diagnose")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -592,57 +592,57 @@ def kb_dept_select(flow: str, church: str) -> InlineKeyboardMarkup:
 # 명령어 핸들러
 # ═════════════════════════════════════════════════════════════════════════════
 HELP_TEXT = (
-    "📖 *결석자 타겟 심방 봇 — 사용법*\n"
+    "📖 <b>결석자 타겟 심방 봇 — 사용법</b>\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-    "*1️⃣ 방 설정 (최초 1회)*\n"
-    "`/start` 또는 `/setup` 으로 이 방의 담당 범위 설정:\n"
-    "   교회 → 부서 → 지역 → 구역\n"
-    "교회까지만 설정하면 *교회 전체 결석자* 조회 가능\n"
-    "설정 후 `📋 결석자 심방` 에서 해당 범위의 결석자만 표시\n\n"
+    "<b>📘 1️⃣ 방 설정 (최초 1회)</b>\n"
+    "<code>/start</code> 또는 <code>/setup</code> 으로 이 방의 담당 범위 설정:\n"
+    "   교회 → 부서 → 지역 (필수) → 구역 (선택)\n"
+    "⚠️ 지역까지 필수 — 개인정보 보호\n"
+    "설정 후 📋 결석자 심방 에서 해당 범위의 결석자만 표시\n\n"
 
-    "*2️⃣ 결석자 심방 기록 흐름*\n"
-    "메인 메뉴 → `📋 결석자 심방` 탭\n"
-    "→ 결석자 선택 → *8단계* 순차 입력:\n"
+    "<b>📝 2️⃣ 결석자 심방 기록 흐름</b>\n"
+    "메인 메뉴 → 📋 결석자 심방 탭\n"
+    "→ 결석자 선택 → <b>8단계</b> 순차 입력:\n"
     "   ① 심방자 ② 심방날짜 ③ 심방계획\n"
     "   ④ 타겟여부 ⑤ 진행여부 ⑥ 예배확답\n"
     "   ⑦ 진행사항 ⑧ 예배참석\n"
     "→ 모든 필드 완료 후 확인 → 저장\n"
-    "입력 중 `❌ 입력 취소` 버튼 또는 `/cancel` 로 중단 가능\n\n"
+    "입력 중 ❌ 입력 취소 버튼 또는 <code>/cancel</code> 로 중단 가능\n\n"
 
-    "*3️⃣ 특별관리 결석자 (연속결석 4회 이상)*\n"
-    "메인 메뉴 → `🚨 특별관리결석자` 탭\n"
+    "<b>🚨 3️⃣ 특별관리 결석자 (연속결석 4회 이상)</b>\n"
+    "메인 메뉴 → 🚨 특별관리결석자 탭\n"
     "→ 교회 → 부서 → 결석자 선택\n"
-    "→ 이 방이 *감지방* 으로 등록되고 4항목 체크리스트 표시:\n"
+    "→ 이 방이 <b>감지방</b> 으로 등록되고 4항목 체크리스트 표시:\n"
     "   ① 대책방 초대완료 (최초 1회)\n"
     "   ② 금주 피드백 진행 (주간 리셋)\n"
     "   ③ 금주 심방예정일\n"
     "   ④ 금주 심방계획\n"
-    f"매주 목요일 07:00 KST 에 미체크 항목 리마인더 발송\n\n"
+    "매주 목요일 07:00 KST 에 미체크 항목 리마인더 발송\n\n"
 
-    "*4️⃣ 미니앱 (개인 채팅에서만)*\n"
-    "`📝 결석자 심방 기록 (폼)` 버튼 탭\n"
+    "<b>📱 4️⃣ 미니앱 (개인 채팅에서만)</b>\n"
+    "📝 결석자 심방 기록 (폼) 버튼 탭\n"
     "→ 이름+전화뒷4로 결석자 검색\n"
     "→ 기존 심방 기록 자동 로드 → 보충/수정 후 저장\n"
     "⚠️ 그룹방에서는 미니앱 버튼 안 보임 (텔레그램 정책)\n\n"
 
-    "*📅 자동 알림 스케줄*\n"
-    "• *수요일 07:00 KST* → 모든 방에 이번 주 결석자 심방계획 요청\n"
-    "• *목요일 07:00 KST* → 특별관리 대상 미체크 항목 리마인더 (연속결석자 방)\n\n"
+    "<b>📅 자동 알림 스케줄</b>\n"
+    "• <b>수요일 07:00 KST</b> → 모든 방에 이번 주 결석자 심방계획 요청\n"
+    "• <b>목요일 07:00 KST</b> → 특별관리 대상 미체크 항목 리마인더 (연속결석자 방)\n\n"
 
-    "*5️⃣ 명령어 모음*\n"
-    "• `/start` — 방 설정 + 메인 메뉴\n"
-    "• `/menu` — 메인 메뉴\n"
-    "• `/setup` — 방 범위 재설정 (최초 설정자만)\n"
-    "• `/myscope` — 이 방의 현재 범위 확인\n"
-    "• `/chatid` — 이 방의 Chat ID 확인 🆕\n"
-    "• `/cancel` — 현재 입력 중단\n"
-    "• `/help` — 이 사용법\n"
-    "• `/diagnose` — DB 진단\n\n"
+    "<b>⌨️ 5️⃣ 명령어 모음</b> <i>(탭하면 복사)</i>\n"
+    "• <code>/start</code> — 방 설정 + 메인 메뉴\n"
+    "• <code>/menu</code> — 메인 메뉴\n"
+    "• <code>/setup</code> — 방 범위 재설정 (최초 설정자만)\n"
+    "• <code>/myscope</code> — 이 방의 현재 범위 확인\n"
+    "• <code>/chatid</code> — 이 방의 Chat ID 확인\n"
+    "• <code>/cancel</code> — 현재 입력 중단\n"
+    "• <code>/help</code> — 이 사용법\n"
+    "• <code>/diagnose</code> — DB 진단\n\n"
 
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "🌐 *상세 분석·통계·CSV 는 웹 대시보드에서.*\n"
-    "💬 문제 있으면 `/diagnose` 결과를 관리자에게.\n"
+    "🌐 <b>상세 분석·통계·CSV 는 웹 대시보드에서</b>\n"
+    "💬 문제 있으면 <code>/diagnose</code> 결과를 관리자에게"
 )
 
 # 하위 호환
@@ -650,9 +650,17 @@ HELP_TEXT_1 = HELP_TEXT
 HELP_TEXT_2 = ""
 
 async def _send_help(update: Update):
-    """도움말 전송 (한 메시지, 4096자 이하로 유지)."""
-    await safe_reply_text(update.message, HELP_TEXT, parse_mode="Markdown",
-                          reply_markup=kb_main_menu(is_private_chat(update)))
+    """도움말 전송 — HTML parse_mode (명령어 탭 복사 가능)"""
+    try:
+        await safe_reply_text(update.message, HELP_TEXT, parse_mode="HTML",
+                              reply_markup=kb_main_menu(is_private_chat(update)))
+    except Exception as e:
+        logger.warning("help HTML 실패, 평문: %s", e)
+        plain = (HELP_TEXT.replace("<b>","").replace("</b>","")
+                          .replace("<i>","").replace("</i>","")
+                          .replace("<code>","").replace("</code>",""))
+        await safe_reply_text(update.message, plain,
+                              reply_markup=kb_main_menu(is_private_chat(update)))
 
 
 async def safe_reply_text(message, text: str, **kwargs):
@@ -1024,8 +1032,9 @@ async def _on_scope_stop(update: Update, chat_id: int, stop_level: str):
     ctx = await get_ctx(chat_id)
     church = ctx.get("church_filter")
     dept   = ctx.get("dept_filter") if stop_level in ("dept","region","zone") else None
-    region = ctx.get("editing_region") if stop_level in ("region","zone") else None
-    zone   = ctx.get("editing_zone") if stop_level == "zone" else None
+    # 🔧 editing_region/editing_zone 대신 region_filter/(없음) 사용
+    region = ctx.get("region_filter") if stop_level in ("region","zone") else None
+    zone   = None  # 구역은 텍스트 입력으로만 완료되므로 stop 에서는 항상 None
 
     if not church:
         await q.edit_message_text("❌ 교회 정보가 없습니다. /setup 다시 시작.")
@@ -1073,9 +1082,19 @@ async def _on_scope_text_input(update: Update, chat_id: int, text: str):
     user = update.effective_user
 
     if step == "awaiting_scope_region_text":
-        # 지역 입력
+        # 지역 입력 — region_filter 필드에 임시 저장 (editing_region 대신)
+        # 이유: set_telegram_visit_context RPC 가 editing_region 파라미터를 받지 않음
         region = text.strip()
-        await save_ctx(chat_id, editing_region=region, editing_step="awaiting_scope_zone_text")
+        if not region:
+            await safe_reply_text(
+                update.message,
+                "⚠️ 지역 이름이 비어있습니다. 다시 입력해주세요.\n예: `강북`, `노원`",
+                parse_mode="Markdown",
+                reply_markup=kb_setup_region(),
+            )
+            return True
+
+        await save_ctx(chat_id, region_filter=region, editing_step="awaiting_scope_zone_text")
         church = ctx.get("church_filter") or ""
         dept = ctx.get("dept_filter") or ""
         await safe_reply_text(
@@ -1093,11 +1112,17 @@ async def _on_scope_text_input(update: Update, chat_id: int, text: str):
 
     if step == "awaiting_scope_zone_text":
         zone = text.strip()
-        await save_ctx(chat_id, editing_zone=zone)
-        # 구역까지 완료 - 바로 저장
         church = ctx.get("church_filter") or ""
         dept = ctx.get("dept_filter") or ""
-        region = ctx.get("editing_region") or ""
+        region = ctx.get("region_filter") or ""  # 🔧 editing_region 대신 region_filter 사용
+
+        if not region:
+            await safe_reply_text(
+                update.message,
+                "❌ 지역 정보가 세션에서 사라졌습니다.\n/setup 으로 다시 시작해주세요.",
+            )
+            return True
+
         owner_name = (user.full_name if user else "") or (user.username if user else "")
         chat_title = update.effective_chat.title or update.effective_chat.full_name or ""
 
@@ -1171,7 +1196,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔧 방 범위 설정", callback_data="scope_setup")],
-                    [InlineKeyboardButton("❓ 사용법", callback_data="show_help")],
+                    [InlineKeyboardButton("📘 사용법", callback_data="show_help")],
                 ]),
             )
     else:
@@ -1188,7 +1213,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🏠 *메인 메뉴*\n\n"
         f"📅 현재 주차: *{md(week_label) if week_label else '미등록'}*\n"
         "아래 버튼에서 원하는 기능을 선택하세요 👇\n\n"
-        "💡 사용법은 *❓ 사용법* 버튼 또는 `/help`"
+        "💡 사용법은 *📘 사용법* 버튼 또는 `/help`"
     )
     await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb_main_menu(is_private_chat(update)))
     # 리플라이 키보드가 사라져있을 수 있으니 복구
@@ -1298,9 +1323,16 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "m:special":
             await _show_church_select(update, "sp")
         elif data == "m:help":
-            # 사용법은 길어서 2개로 분할 전송. edit_message는 덮어쓰므로 새 메시지로 전송.
-            await q.message.reply_text(HELP_TEXT_1, parse_mode="Markdown")
-            await q.message.reply_text(HELP_TEXT_2, parse_mode="Markdown", reply_markup=kb_main_menu(is_private_chat(update)))
+            # 사용법은 HTML parse_mode (명령어 탭 복사 지원)
+            try:
+                await q.message.reply_text(HELP_TEXT, parse_mode="HTML",
+                                           reply_markup=kb_main_menu(is_private_chat(update)))
+            except Exception as he:
+                logger.warning("help HTML 실패: %s", he)
+                plain = (HELP_TEXT.replace("<b>","").replace("</b>","")
+                                  .replace("<i>","").replace("</i>","")
+                                  .replace("<code>","").replace("</code>",""))
+                await q.message.reply_text(plain, reply_markup=kb_main_menu(is_private_chat(update)))
         elif data == "m:diagnose":
             # 진단은 새 메시지로 전송 (긴 내용)
             class FakeUpd:
@@ -1686,7 +1718,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "🚨 특별관리결석자":
             await _show_church_menu(update, "sp")
             return
-        if text == "❓ 사용법":
+        if text == "📘 사용법":
             await _send_help(update)
             return
         if text == "🏠 메인 메뉴":
@@ -1850,7 +1882,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step in STEPS:
         # 🛡 검증 1: 리플라이 키보드 라벨이면 "입력 안 함"으로 간주하고 에러 안내
         RESERVED_LABELS = {
-            "📋 결석자 심방", "🚨 특별관리결석자", "❓ 사용법",
+            "📋 결석자 심방", "🚨 특별관리결석자", "📘 사용법",
             "🏠 메인 메뉴", "📝 결석자 심방 기록 (폼)",
         }
         if text in RESERVED_LABELS:
