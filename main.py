@@ -1244,7 +1244,31 @@ async def _show_home(update: Update):
 
 
 async def _show_church_select(update: Update, flow: str):
+    """scope 기반 자동 점프. scope 없으면 교회 선택, 있으면 자동 진행."""
     q = update.callback_query
+    chat_id = update.effective_chat.id
+    scope = await get_chat_scope(chat_id)
+
+    # 그룹방에서 scope 미설정이면 설정 유도
+    if not scope and not is_private_chat(update):
+        await q.edit_message_text(
+            "📌 이 방은 담당 범위가 설정되지 않았습니다.\n\n"
+            "먼저 `/setup` 으로 교회/부서/지역/구역을 설정하세요.\n"
+            "설정 후 이 방에서는 해당 범위의 결석자만 표시됩니다.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔧 방 범위 설정", callback_data="scope_setup")],
+                [InlineKeyboardButton("◀ 메인 메뉴", callback_data="m:home")],
+            ]),
+        )
+        return
+
+    # scope 있음 - 자동 진행
+    if scope:
+        await _scope_jump(update, chat_id, scope, flow)
+        return
+
+    # 개인방 (scope 없을 수 있음) - 기존처럼 교회 선택
     header = {
         "abs": "📋 *결석자 심방*\n\n① *교회* 를 선택하세요 👇",
         "sp":  "🚨 *특별관리결석자*\n\n① *교회* 를 선택하세요 👇\n_(연속결석 4회 이상만 표시)_",
@@ -1253,7 +1277,35 @@ async def _show_church_select(update: Update, flow: str):
 
 
 async def _show_church_menu(update: Update, flow: str):
-    """리플라이 키보드에서 진입할 때 (새 메시지로 교회 선택 화면 표시)."""
+    """리플라이 키보드에서 진입할 때 — scope 자동 반영"""
+    chat_id = update.effective_chat.id
+    scope = await get_chat_scope(chat_id)
+
+    if not scope and not is_private_chat(update):
+        await update.message.reply_text(
+            "📌 이 방은 담당 범위가 설정되지 않았습니다.\n\n"
+            "먼저 `/setup` 으로 교회/부서/지역/구역을 설정하세요.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔧 방 범위 설정", callback_data="scope_setup")],
+            ]),
+        )
+        return
+
+    if scope:
+        # scope 에 맞춰 결석자 목록 직접 표시
+        class FakeQ:
+            message = update.message
+            async def edit_message_text(self, *a, **kw):
+                await update.message.reply_text(*a, **kw)
+        class FakeUpd:
+            callback_query = FakeQ()
+            effective_chat = update.effective_chat
+            message = update.message
+        # 메시지 타입으로 분기해서 전송
+        await _scope_jump_from_message(update, chat_id, scope, flow)
+        return
+
     header = {
         "abs": "📋 *결석자 심방*\n\n① *교회* 를 선택하세요 👇",
         "sp":  "🚨 *특별관리결석자*\n\n① *교회* 를 선택하세요 👇\n_(연속결석 4회 이상만 표시)_",
@@ -1261,6 +1313,130 @@ async def _show_church_menu(update: Update, flow: str):
     await update.message.reply_text(
         header, parse_mode="Markdown", reply_markup=kb_church_select(flow)
     )
+
+
+async def _scope_jump(update: Update, chat_id: int, scope: dict, flow: str):
+    """scope 기반 결석자 목록 바로 표시 (edit)"""
+    q = update.callback_query
+    week_key, week_label = await get_active_week()
+    if not week_key:
+        await q.edit_message_text("❌ 등록된 주차가 없습니다.",
+                                  reply_markup=kb_main_menu(is_private_chat(update)))
+        return
+
+    church = scope.get("church")
+    dept   = scope.get("dept")
+    region = scope.get("region_name")
+    zone   = scope.get("zone_name")
+
+    await save_ctx(chat_id, active_week_key=week_key,
+                   church_filter=church, dept_filter=dept)
+
+    rows = await _fetch_scoped(week_key, church, dept, region, zone, flow)
+    scope_txt = scope_label(scope)
+
+    if flow == "sp":
+        header = f"🚨 <b>특별관리결석자</b>\n📌 {_escape_html(scope_txt)} · {_escape_html(week_label or week_key)}\n"
+    else:
+        header = f"📋 <b>결석자 심방</b>\n📌 {_escape_html(scope_txt)} · {_escape_html(week_label or week_key)}\n"
+
+    if not rows:
+        await q.edit_message_text(
+            header + "\n📭 해당 범위의 결석자가 없습니다.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀ 메인 메뉴", callback_data="m:home")],
+            ]),
+        )
+        return
+
+    keyboard = _build_absentee_buttons(rows, flow)
+    keyboard.append([InlineKeyboardButton("◀ 메인 메뉴", callback_data="m:home")])
+    await q.edit_message_text(
+        header + f"\n총 <b>{len(rows)}</b>명\n결석자를 선택하세요 👇",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def _scope_jump_from_message(update: Update, chat_id: int, scope: dict, flow: str):
+    """scope 기반 결석자 목록 바로 표시 (new message)"""
+    week_key, week_label = await get_active_week()
+    if not week_key:
+        await update.message.reply_text("❌ 등록된 주차가 없습니다.")
+        return
+
+    church = scope.get("church"); dept = scope.get("dept")
+    region = scope.get("region_name"); zone = scope.get("zone_name")
+
+    await save_ctx(chat_id, active_week_key=week_key,
+                   church_filter=church, dept_filter=dept)
+
+    rows = await _fetch_scoped(week_key, church, dept, region, zone, flow)
+    scope_txt = scope_label(scope)
+
+    if flow == "sp":
+        header = f"🚨 <b>특별관리결석자</b>\n📌 {_escape_html(scope_txt)} · {_escape_html(week_label or week_key)}\n"
+    else:
+        header = f"📋 <b>결석자 심방</b>\n📌 {_escape_html(scope_txt)} · {_escape_html(week_label or week_key)}\n"
+
+    if not rows:
+        await update.message.reply_text(
+            header + "\n📭 해당 범위의 결석자가 없습니다.",
+            parse_mode="HTML",
+        )
+        return
+
+    keyboard = _build_absentee_buttons(rows, flow)
+    keyboard.append([InlineKeyboardButton("◀ 메인 메뉴", callback_data="m:home")])
+    await update.message.reply_text(
+        header + f"\n총 <b>{len(rows)}</b>명\n결석자를 선택하세요 👇",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+def _escape_html(s) -> str:
+    import html as _h
+    return _h.escape(str(s)) if s is not None else ""
+
+
+async def _fetch_scoped(week_key, church, dept, region, zone, flow):
+    """scope 범위 + flow (abs/sp) 에 맞춰 결석자 목록 반환"""
+    path = (
+        f"weekly_visit_targets"
+        f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
+        f"&week_key=eq.{quote(week_key)}"
+        f"&church=eq.{quote(church)}"
+    )
+    if dept:   path += f"&dept=eq.{quote(dept)}"
+    if region: path += f"&region_name=eq.{quote(region)}"
+    if zone:   path += f"&zone_name=eq.{quote(normalize_zone(zone))}"
+    if flow == "sp":
+        path += "&consecutive_absent_count=gte.4"
+        path += "&order=consecutive_absent_count.desc,name.asc"
+    else:
+        path += "&order=dept.asc,region_name.asc,zone_name.asc,name.asc"
+    path += "&limit=5000"
+
+    rows = await sb_get(path)
+    return await enrich_names(rows or [])
+
+
+def _build_absentee_buttons(rows, flow, max_buttons=40):
+    """결석자 이름 버튼 목록 생성 (페이지네이션 고려)"""
+    keyboard = []
+    cb_prefix = "sp_pk" if flow == "sp" else "abs_sel"
+    for r in rows[:max_buttons]:
+        name = r.get("name", "?")
+        zone = r.get("zone_name", "") or r.get("region_name", "") or ""
+        streak = r.get("consecutive_absent_count", 0) or 0
+        label = f"{name} {zone} · 연속{streak}회" if zone else f"{name} · 연속{streak}회"
+        if len(label) > 60: label = label[:57] + "..."
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"{cb_prefix}:{r['row_id']}")])
+    if len(rows) > max_buttons:
+        keyboard.append([InlineKeyboardButton(f"... 외 {len(rows)-max_buttons}명 (범위를 좁혀주세요)", callback_data="noop")])
+    return keyboard
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1502,28 +1678,44 @@ async def _on_abs_select(update: Update, chat_id: int, row_id: str):
     week_key = ctx.get("active_week_key", "")
     prog = await get_progress(week_key, row_id)
     rows = await sb_get(
-        f"weekly_visit_targets?select=name,region_name,zone_name"
+        f"weekly_visit_targets?select=name,region_name,zone_name,church,dept,phone_last4"
         f"&row_id=eq.{quote(row_id)}&week_key=eq.{quote(week_key)}"
     )
-    name = rows[0]["name"] if rows else row_id
+    if rows:
+        # 이름 마스킹 복구 시도
+        enriched = await enrich_names(rows)
+        name = enriched[0]["name"] if enriched else row_id
+    else:
+        name = row_id
 
     await save_ctx(chat_id, editing_row_id=row_id, editing_step="shepherd")
 
+    # 🛡 HTML parse_mode 사용 (Markdown 보다 관대하여 특수문자 이름에도 파싱 에러 없음)
+    import html as _html
     existing = ""
     if prog:
         existing = (
-            f"\n\n📂 *기존 입력값*\n"
-            f"심방자: {md(prog.get('shepherd','') or '없음')}\n"
-            f"심방날짜: {md(prog.get('visit_date_display','') or '없음')}\n"
+            f"\n\n📂 <b>기존 입력값</b>\n"
+            f"심방자: {_html.escape(prog.get('shepherd','') or '없음')}\n"
+            f"심방날짜: {_html.escape(prog.get('visit_date_display','') or '없음')}\n"
             f"진행여부: {'완료' if prog.get('is_done') else '미완료'}"
         )
 
-    await q.message.reply_text(
-        f"✏️ *{md(name)}* 님 심방 기록 시작{existing}\n\n"
-        f"1️⃣ {STEP_LABELS['shepherd']}\n입력해주세요:\n\n"
-        f"_중단하려면 /cancel_",
-        parse_mode="Markdown",
-    )
+    try:
+        await q.message.reply_text(
+            f"✏️ <b>{_html.escape(str(name))}</b> 님 심방 기록 시작{existing}\n\n"
+            f"1️⃣ {_html.escape(STEP_LABELS['shepherd'])}\n입력해주세요:\n\n"
+            f"<i>중단하려면 ❌ 취소 버튼 또는 /cancel</i>",
+            parse_mode="HTML",
+            reply_markup=kb_cancel_only(),
+        )
+    except Exception as e:
+        logger.warning("HTML parse 실패, 평문으로 전송: %s", e)
+        await q.message.reply_text(
+            f"✏️ {name} 님 심방 기록 시작\n\n"
+            f"1️⃣ {STEP_LABELS['shepherd']}\n입력해주세요:",
+            reply_markup=kb_cancel_only(),
+        )
 
 
 async def _on_choice(update: Update, chat_id: int, step: str, value: str):
