@@ -4,7 +4,7 @@
 
 흐름:
   /start → 메인 메뉴 (3버튼)
-    📋 결석자 심방 → 교회 → 부서 → 지역입력 → 결석자 → 8단계 기록
+    📋 결석자 심방 → 교회 → 부서 → 지역입력 → 결석자 → 7단계 기록
     🚨 특별관리 → 교회 → 부서 → 4회+명단 → 선택(방감지) → 4항목 체크리스트
     ❓ 도움말 → 전체 사용법
 
@@ -54,8 +54,8 @@ HEADERS = {
 CHURCHES = ["서울교회", "포천교회", "구리교회", "동대문교회", "의정부교회"]
 DEPTS    = ["자문회", "장년회", "부녀회", "청년회"]
 
-# ── 심방 입력 8단계 ────────────────────────────────────────────────────────────
-STEPS = ["shepherd", "date", "plan", "target", "done", "worship", "note", "attendance"]
+# ── 심방 입력 7단계 ────────────────────────────────────────────────────────────
+STEPS = ["shepherd", "date", "plan", "target", "done", "worship", "note"]
 STEP_LABELS = {
     "shepherd":   "👤 심방자 (예: 홍길동(집사))",
     "date":       "📅 심방날짜 (예: 4/27 또는 2026-04-27)",
@@ -64,13 +64,11 @@ STEP_LABELS = {
     "done":       "✅ 진행여부",
     "worship":    "🙏 예배확답",
     "note":       "📋 진행사항 (없으면 '없음')",
-    "attendance": "⛪ 예배참석",
 }
 STEP_CHOICES = {
     "target":     [["타겟", "미타겟"]],
     "done":       [["완료", "미완료"]],
     "worship":    [["확정", "미정", "불참"]],
-    "attendance": [["참석", "불참"]],
 }
 
 # ── 특별관리 4항목 ─────────────────────────────────────────────────────────────
@@ -603,10 +601,10 @@ HELP_TEXT = (
 
     "<b>📝 2️⃣ 결석자 심방 기록 흐름</b>\n"
     "메인 메뉴 → 📋 결석자 심방 탭\n"
-    "→ 결석자 선택 → <b>8단계</b> 순차 입력:\n"
+    "→ 결석자 선택 → <b>7단계</b> 순차 입력:\n"
     "   ① 심방자 ② 심방날짜 ③ 심방계획\n"
     "   ④ 타겟여부 ⑤ 진행여부 ⑥ 예배확답\n"
-    "   ⑦ 진행사항 ⑧ 예배참석\n"
+    "   ⑦ 진행사항\n"
     "→ 모든 필드 완료 후 확인 → 저장\n"
     "입력 중 ❌ 입력 취소 버튼 또는 <code>/cancel</code> 로 중단 가능\n\n"
 
@@ -2080,7 +2078,7 @@ async def _on_abs_select(update: Update, chat_id: int, row_id: str):
             key_map = {
                 "shepherd":"shepherd", "date":"visit_date_display", "plan":"plan_text",
                 "target":"is_target", "done":"is_done", "worship":"attend_confirm",
-                "note":"note", "attendance":"attendance"
+                "note":"note"
             }
             dbkey = key_map.get(s, s)
             val = prog.get(dbkey)
@@ -2100,7 +2098,6 @@ async def _on_abs_select(update: Update, chat_id: int, row_id: str):
             tmp_done       = "완료" if prog.get("is_done") else ("미완료" if prog.get("is_done") is False else ""),
             tmp_worship    = prog.get("attend_confirm", "") or "",
             tmp_note       = prog.get("note", "") or "",
-            tmp_attendance = prog.get("attendance", "") or "",
         )
 
     await save_ctx(chat_id, editing_row_id=row_id, editing_step=start_step)
@@ -2164,8 +2161,7 @@ async def _show_edit_menu(update, chat_id: int, row_id: str, name: str, prog: di
         f"④ 타겟여부: {fmt(prog.get('is_target'), '타겟', '미타겟')}\n"
         f"⑤ 진행여부: {fmt(prog.get('is_done'), '완료', '미완료')}\n"
         f"⑥ 예배확답: {fmt(prog.get('attend_confirm'))}\n"
-        f"⑦ 진행사항: {fmt(prog.get('note'))}\n"
-        f"⑧ 예배참석: {fmt(prog.get('attendance'))}\n\n"
+        f"⑦ 진행사항: {fmt(prog.get('note'))}\n\n"
         f"<i>수정할 항목을 선택하세요 👇</i>"
     )
 
@@ -2177,8 +2173,7 @@ async def _show_edit_menu(update, chat_id: int, row_id: str, name: str, prog: di
          InlineKeyboardButton("④ 타겟여부 수정", callback_data="edit_step:target")],
         [InlineKeyboardButton("⑤ 진행여부 수정", callback_data="edit_step:done"),
          InlineKeyboardButton("⑥ 예배확답 수정", callback_data="edit_step:worship")],
-        [InlineKeyboardButton("⑦ 진행사항 수정", callback_data="edit_step:note"),
-         InlineKeyboardButton("⑧ 예배참석 수정", callback_data="edit_step:attendance")],
+        [InlineKeyboardButton("⑦ 진행사항 수정", callback_data="edit_step:note")],
         [InlineKeyboardButton("🔄 전체 다시 입력", callback_data=f"edit_full:{row_id}")],
         [InlineKeyboardButton("◀ 메인 메뉴", callback_data="m:home")],
     ]
@@ -2225,7 +2220,6 @@ async def _on_edit_step(update: Update, chat_id: int, step: str):
                 "done": "완료" if prog.get("is_done") else ("미완료" if prog.get("is_done") is False else ""),
                 "worship": prog.get("attend_confirm", ""),
                 "note": prog.get("note", ""),
-                "attendance": prog.get("attendance", ""),
             }
             await save_ctx(chat_id, **{tmp_key: key_map.get(step, "") or ""})
 
@@ -2367,8 +2361,7 @@ async def _show_confirm(update, chat_id: int, ctx: dict):
         f"타겟여부: {_e(ctx.get('tmp_target',''))}\n"
         f"진행여부: {_e(ctx.get('tmp_done',''))}\n"
         f"예배확답: {_e(ctx.get('tmp_worship',''))}\n"
-        f"진행사항: {_e(ctx.get('tmp_note',''))}\n"
-        f"예배참석: {_e(ctx.get('tmp_attendance',''))}\n\n"
+        f"진행사항: {_e(ctx.get('tmp_note',''))}\n\n"
         f"저장하시겠습니까?"
     )
     buttons = [[
