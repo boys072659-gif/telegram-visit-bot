@@ -1474,13 +1474,16 @@ async def _show_church_select(update: Update, flow: str):
     chat_id = update.effective_chat.id
     scope = await get_chat_scope(chat_id)
 
-    # 그룹방에서 scope 미설정이면 설정 유도
-    if not scope and not is_private_chat(update):
+    # 🔒 scope 미설정이면 설정 유도 (개인방/그룹방 동일)
+    if not scope:
+        chat_type_hint = "개인방" if is_private_chat(update) else "그룹방"
         await q.edit_message_text(
-            "📌 이 방은 담당 범위가 설정되지 않았습니다.\n\n"
-            "먼저 `/setup` 으로 교회/부서/지역/구역을 설정하세요.\n"
-            "설정 후 이 방에서는 해당 범위의 결석자만 표시됩니다.",
-            parse_mode="Markdown",
+            f"📌 <b>{chat_type_hint}에서도 담당 범위 설정이 필요합니다</b>\n\n"
+            f"결석자 정보 보호를 위해 이 방에서 볼 수 있는 범위를\n"
+            f"미리 설정해야 합니다 (<b>지역까지 필수</b>).\n\n"
+            f"• 교회 → 부서 → 지역 (→ 구역)\n\n"
+            f"아래 버튼을 눌러 설정하세요 👇",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔧 방 범위 설정", callback_data="scope_setup")],
                 [InlineKeyboardButton("◀ 메인 메뉴", callback_data="m:home")],
@@ -1489,16 +1492,7 @@ async def _show_church_select(update: Update, flow: str):
         return
 
     # scope 있음 - 자동 진행
-    if scope:
-        await _scope_jump(update, chat_id, scope, flow)
-        return
-
-    # 개인방 (scope 없을 수 있음) - 기존처럼 교회 선택
-    header = {
-        "abs": "📋 *결석자 심방*\n\n① *교회* 를 선택하세요 👇",
-        "sp":  "🚨 *특별관리결석자*\n\n① *교회* 를 선택하세요 👇\n_(연속결석 4회 이상만 표시)_",
-    }[flow]
-    await q.edit_message_text(header, parse_mode="Markdown", reply_markup=kb_church_select(flow))
+    await _scope_jump(update, chat_id, scope, flow)
 
 
 async def _show_church_menu(update: Update, flow: str):
@@ -1510,38 +1504,22 @@ async def _show_church_menu(update: Update, flow: str):
     chat_id = update.effective_chat.id
     scope = await get_chat_scope(chat_id)
 
-    if not scope and not is_private_chat(update):
+    if not scope:
+        chat_type_hint = "개인방" if is_private_chat(update) else "그룹방"
         await update.message.reply_text(
-            "📌 이 방은 담당 범위가 설정되지 않았습니다.\n\n"
-            "먼저 `/setup` 으로 교회/부서/지역/구역을 설정하세요.",
-            parse_mode="Markdown",
+            f"📌 <b>{chat_type_hint}에서도 담당 범위 설정이 필요합니다</b>\n\n"
+            f"결석자 정보 보호를 위해 이 방에서 볼 수 있는 범위를\n"
+            f"미리 설정해야 합니다 (<b>지역까지 필수</b>).\n\n"
+            f"아래 버튼을 눌러 설정하세요 👇",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔧 방 범위 설정", callback_data="scope_setup")],
             ]),
         )
         return
 
-    if scope:
-        # scope 에 맞춰 결석자 목록 직접 표시
-        class FakeQ:
-            message = update.message
-            async def edit_message_text(self, *a, **kw):
-                await update.message.reply_text(*a, **kw)
-        class FakeUpd:
-            callback_query = FakeQ()
-            effective_chat = update.effective_chat
-            message = update.message
-        # 메시지 타입으로 분기해서 전송
-        await _scope_jump_from_message(update, chat_id, scope, flow)
-        return
-
-    header = {
-        "abs": "📋 *결석자 심방*\n\n① *교회* 를 선택하세요 👇",
-        "sp":  "🚨 *특별관리결석자*\n\n① *교회* 를 선택하세요 👇\n_(연속결석 4회 이상만 표시)_",
-    }[flow]
-    await update.message.reply_text(
-        header, parse_mode="Markdown", reply_markup=kb_church_select(flow)
-    )
+    # scope 에 맞춰 결석자 목록 직접 표시
+    await _scope_jump_from_message(update, chat_id, scope, flow)
 
 
 async def _scope_jump(update: Update, chat_id: int, scope: dict, flow: str):
@@ -3455,61 +3433,78 @@ def main():
             )
 
     async def miniapp_search_handler(request):
-        """결석자 검색: 이름+전화뒷4+교회+부서로 target 찾고, 기존 progress 함께 반환."""
+        """결석자 검색: 이름(필수) + 선택 필터 (전화뒷4/교회/부서/지역/구역)"""
         name   = (request.query.get("name") or "").strip()
         phone  = (request.query.get("phone") or "").strip()
         church = (request.query.get("church") or "").strip()
         dept   = (request.query.get("dept") or "").strip()
+        region = (request.query.get("region") or "").strip()
+        zone   = (request.query.get("zone") or "").strip()
 
-        if not (name and phone and church and dept):
-            return web.json_response({"ok": False, "error": "이름/전화/교회/부서 모두 필요"}, status=400)
+        # 🔧 이름만 필수, 나머지는 선택 (여러 필터 조합 가능)
+        if not name:
+            return web.json_response({"ok": False, "error": "이름은 필수입니다"}, status=400)
 
-        try:
-            # 최신 주차 우선
-            week_key, _ = await get_active_week()
-            if not week_key:
-                return web.json_response({"ok": False, "error": "등록된 주차 없음. 명단을 먼저 업로드해주세요."}, status=404)
-
-            # 결석자 찾기 (active week 우선, 없으면 최근 주차로 fallback)
-            path = (
+        def _build_path(week_key, zone_value=None):
+            p = (
                 f"weekly_visit_targets"
                 f"?select=row_id,week_key,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
                 f"&week_key=eq.{quote(week_key)}"
-                f"&church=eq.{quote(church)}"
-                f"&dept=eq.{quote(dept)}"
                 f"&name=eq.{quote(name)}"
-                f"&phone_last4=eq.{quote(phone)}"
-                f"&limit=1"
             )
-            rows = await sb_get(path)
+            if phone:  p += f"&phone_last4=eq.{quote(phone)}"
+            if church: p += f"&church=eq.{quote(church)}"
+            if dept:   p += f"&dept=eq.{quote(dept)}"
+            if region: p += f"&region_name=eq.{quote(region)}"
+            if zone_value: p += f"&zone_name=eq.{quote(zone_value)}"
+            p += "&limit=5"
+            return p
 
-            # 못 찾으면 가장 최근 주차에서 재시도
-            if not rows:
-                recent_weeks = await sb_get(
-                    "weekly_target_weeks?select=week_key&order=week_key.desc&limit=4"
-                )
-                for w in recent_weeks or []:
+        try:
+            week_key, _ = await get_active_week()
+            if not week_key:
+                return web.json_response({"ok": False, "error": "등록된 주차 없음"}, status=404)
+
+            weeks_to_try = [week_key]
+            try:
+                recent = await sb_get("weekly_target_weeks?select=week_key&order=week_key.desc&limit=4")
+                for w in (recent or []):
                     wk = w.get("week_key")
-                    if wk == week_key:
-                        continue
-                    path2 = (
-                        f"weekly_visit_targets"
-                        f"?select=row_id,week_key,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
-                        f"&week_key=eq.{quote(wk)}"
-                        f"&church=eq.{quote(church)}"
-                        f"&dept=eq.{quote(dept)}"
-                        f"&name=eq.{quote(name)}"
-                        f"&phone_last4=eq.{quote(phone)}"
-                        f"&limit=1"
-                    )
-                    rows = await sb_get(path2)
-                    if rows:
-                        break
+                    if wk and wk not in weeks_to_try:
+                        weeks_to_try.append(wk)
+            except Exception:
+                pass
+
+            rows = []
+            for wk in weeks_to_try:
+                if zone:
+                    # zone 여러 형태 시도 (4-2 / 4팀2)
+                    zone_norm = normalize_zone(zone)
+                    rows = await sb_get(_build_path(wk, zone_norm))
+                    if not rows and zone != zone_norm:
+                        rows = await sb_get(_build_path(wk, zone))
+                    if not rows:
+                        zone_alt = zone.replace("팀", "-") if "팀" in zone else zone.replace("-", "팀")
+                        if zone_alt != zone and zone_alt != zone_norm:
+                            rows = await sb_get(_build_path(wk, zone_alt))
+                else:
+                    rows = await sb_get(_build_path(wk, None))
+                if rows:
+                    break
 
             if not rows:
                 return web.json_response({"ok": True, "target": None, "progress": None})
 
+            # 여러 명 매칭되면 가장 첫 번째 (전화뒷4로 구분되는게 이상적)
+            if len(rows) > 1:
+                logger.info(f"miniapp search: {len(rows)} matches for {name}, returning first")
+
             target = rows[0]
+
+            # 이름 마스킹 복구
+            enriched = await enrich_names([target])
+            if enriched:
+                target = enriched[0]
 
             # 기존 심방 기록 로드
             prog_rows = await sb_get(

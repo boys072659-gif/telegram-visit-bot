@@ -140,6 +140,7 @@
 <!-- ═══ STEP 1: 결석자 검색 ═══ -->
 <div class="section" id="step1">
   <div class="section-title"><span class="pill">STEP 1</span> 결석자 검색</div>
+  <div class="help" style="margin-bottom:12px">💡 이름만 필수. 동명이인이 많으면 교회·부서·지역·구역을 추가로 선택하세요.</div>
 
   <div class="form-group">
     <label>이름 <span class="required">*</span></label>
@@ -147,19 +148,24 @@
   </div>
 
   <div class="form-group">
-    <label>전화번호 뒷 4자리 <span class="required">*</span></label>
-    <input type="tel" id="q_phone" placeholder="0000" inputmode="numeric" maxlength="4">
-    <div class="help">동명이인 구분용. 숫자 4자리</div>
-  </div>
-
-  <div class="form-group">
-    <label>교회 <span class="required">*</span></label>
+    <label>교회 <span style="color:#94a3b8;font-size:11px">(선택)</span></label>
     <div class="chip-group" id="q_church_chips"></div>
   </div>
 
   <div class="form-group">
-    <label>부서 <span class="required">*</span></label>
+    <label>부서 <span style="color:#94a3b8;font-size:11px">(선택)</span></label>
     <div class="chip-group" id="q_dept_chips"></div>
+  </div>
+
+  <div class="inline-row">
+    <div class="form-group">
+      <label>지역 <span style="color:#94a3b8;font-size:11px">(선택)</span></label>
+      <input type="text" id="q_region" placeholder="예: 강북" maxlength="20" autocomplete="off">
+    </div>
+    <div class="form-group">
+      <label>구역 <span style="color:#94a3b8;font-size:11px">(선택)</span></label>
+      <input type="text" id="q_zone" placeholder="예: 2-1" maxlength="20" autocomplete="off">
+    </div>
   </div>
 
   <button type="button" class="btn-main" onclick="searchAbsentee()">🔍 결석자 찾기</button>
@@ -297,10 +303,6 @@
     });
   });
 
-  document.getElementById('q_phone').addEventListener('input', (e) => {
-    e.target.value = e.target.value.replace(/[^0-9]/g, '').slice(0, 4);
-  });
-
   function showStatus(elId, msg, type){
     const el = document.getElementById(elId);
     el.textContent = msg;
@@ -314,16 +316,18 @@
   async function searchAbsentee(){
     hideStatus('search_status');
     const name = document.getElementById('q_name').value.trim();
-    const phone = document.getElementById('q_phone').value.trim();
 
-    if(!name){ showStatus('search_status', '❌ 이름을 입력해주세요', 'error'); return; }
-    if(!/^\d{4}$/.test(phone)){ showStatus('search_status', '❌ 전화번호 뒷 4자리를 정확히 입력', 'error'); return; }
-    if(!selectedChurch){ showStatus('search_status', '❌ 교회를 선택해주세요', 'error'); return; }
-    if(!selectedDept){ showStatus('search_status', '❌ 부서를 선택해주세요', 'error'); return; }
+    if(!name){ showStatus('search_status', '❌ 이름을 입력해주세요 (필수)', 'error'); return; }
 
     showStatus('search_status', '🔍 검색 중...', 'loading');
     try{
-      const params = new URLSearchParams({ name, phone, church: selectedChurch, dept: selectedDept });
+      const region = (document.getElementById('q_region')?.value || '').trim();
+      const zone = (document.getElementById('q_zone')?.value || '').trim();
+      const params = new URLSearchParams({ name });
+      if(selectedChurch) params.set('church', selectedChurch);
+      if(selectedDept) params.set('dept', selectedDept);
+      if(region) params.set('region', region);
+      if(zone) params.set('zone', zone);
       const resp = await fetch('/miniapp/search?' + params.toString());
       const j = await resp.json();
 
@@ -332,8 +336,9 @@
         return;
       }
       if(!j.target){
+        const hint = [name, selectedChurch, selectedDept, region, zone].filter(Boolean).join(' · ');
         showStatus('search_status',
-          `📭 ${selectedChurch} ${selectedDept} 결석자 명단에 "${name}(${phone})" 없습니다.\n대시보드에서 이번 주차 명단이 업로드됐는지 확인하세요.`,
+          `📭 "${hint}" 에 해당하는 결석자를 찾을 수 없습니다.\n대시보드에서 이번 주차 명단이 업로드됐는지 확인하세요.`,
           'error');
         return;
       }
@@ -356,14 +361,17 @@
     const streak = Number(t.consecutive_absent_count || 0);
     const hasProgress = !!p;
 
+    const phoneHint = t.phone_last4 ? ` <span style="color:#64748b;font-size:11px">(${escapeHtml(t.phone_last4)})</span>` : '';
     const header = `
       <div class="found-card">
-        <strong>${escapeHtml(t.name)}</strong> (${escapeHtml(t.phone_last4 || '')})
+        <strong>${escapeHtml(t.name)}</strong>${phoneHint}
         <span class="tag-streak">연속 ${streak}회</span>
         ${hasProgress ? '<span class="tag-done">📝 기존 기록 있음 (불러옴)</span>' : ''}
         <br>
         <span style="color:#475569;font-size:12px">
           ${escapeHtml(t.church || '')} / ${escapeHtml(t.dept || '')}
+          ${t.region_name ? ' / ' + escapeHtml(t.region_name) : ''}
+          ${t.zone_name ? ' ' + escapeHtml(t.zone_name) : ''}
           / 주차: ${escapeHtml(t.week_key || '')}
         </span>
       </div>
@@ -398,9 +406,10 @@
     currentTarget = null;
     currentProgress = null;
     hideStatus('save_status');
-    // 검색 폼 유지 (이름/전화만 지움, 교회/부서는 유지)
+    // 검색 폼 초기화 (이름/지역/구역만 지움, 교회/부서는 유지)
     document.getElementById('q_name').value = '';
-    document.getElementById('q_phone').value = '';
+    const qRegion = document.getElementById('q_region'); if(qRegion) qRegion.value = '';
+    const qZone = document.getElementById('q_zone'); if(qZone) qZone.value = '';
     document.getElementById('q_name').focus();
     window.scrollTo(0, 0);
   }
