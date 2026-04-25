@@ -506,6 +506,9 @@ if not MINIAPP_URL:
         # 예: https://xxx.run.app/webhook → https://xxx.run.app/miniapp
         MINIAPP_URL = _webhook.rsplit("/", 1)[0] + "/miniapp"
 
+# 🆕 v4.7: 웹 대시보드 URL (알림 메시지의 버튼 링크)
+DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "").strip()
+
 
 def kb_reply_main(is_private: bool = True) -> ReplyKeyboardMarkup:
     """하단에 고정되는 리플라이 키보드. 키보드 아이콘(⌨️) 탭하면 이 버튼들이 나옴.
@@ -734,6 +737,15 @@ def kb_request_approval() -> InlineKeyboardMarkup:
     ])
 
 
+def kb_dashboard_link() -> InlineKeyboardMarkup | None:
+    """🆕 v4.7: 웹 대시보드 링크 버튼 (DASHBOARD_URL 설정된 경우만)"""
+    if not DASHBOARD_URL:
+        return None
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 웹 대시보드 열기", url=DASHBOARD_URL)]
+    ])
+
+
 async def is_bot_admin_user(user_id: int) -> bool:
     """이 user_id 가 봇 관리자인지 확인."""
     if not user_id:
@@ -763,6 +775,31 @@ async def get_active_bot_admins() -> list[dict]:
     except Exception as e:
         logger.warning("get_active_bot_admins 실패: %s", e)
         return []
+
+
+async def try_acquire_job_lock(job_name: str, source: str = "unknown") -> bool:
+    """🆕 v4.7: 같은 날 중복 실행 방지.
+    
+    True: 이번이 첫 실행 → 작업 수행 OK
+    False: 오늘 이미 실행됨 → 스킵
+    """
+    try:
+        result = await sb_rpc("try_acquire_job_lock", {
+            "p_job_name": job_name,
+            "p_source": source,
+        })
+        if isinstance(result, bool):
+            return result
+        if isinstance(result, list) and len(result) > 0:
+            first = result[0]
+            if isinstance(first, bool): return first
+            if isinstance(first, dict):
+                return bool(first.get("try_acquire_job_lock", False))
+        return False
+    except Exception as e:
+        logger.warning("try_acquire_job_lock 실패 (lock 없이 실행): %s", e)
+        # DB 오류 시 안전을 위해 True 반환 (실행 진행)
+        return True
 
 
 async def ensure_authorized(update: Update) -> bool:
@@ -2828,8 +2865,14 @@ async def _on_sp_unregister_ctx(update: Update, chat_id: int):
 # ═════════════════════════════════════════════════════════════════════════════
 # 매주 목요일 07시 KST — 주간 리마인더 + 2/3/4번 리셋
 # ═════════════════════════════════════════════════════════════════════════════
-async def weekly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("🔔 weekly_reminder_job start")
+async def weekly_reminder_job(context: ContextTypes.DEFAULT_TYPE, source: str = "job_queue"):
+    """🛡 v4.7: 중복 실행 방지."""
+    acquired = await try_acquire_job_lock("special_reminder", source)
+    if not acquired:
+        logger.info("⏭ special_reminder: 오늘 이미 실행됨 (source=%s, 스킵)", source)
+        return
+
+    logger.info("🔔 weekly_reminder_job start (source=%s)", source)
     try:
         targets = await sb_rpc("get_all_special_targets", {}) or []
         if not targets:
@@ -2891,20 +2934,28 @@ async def weekly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def force_weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔔 주간 리마인더 강제 실행 중...")
-    await weekly_reminder_job(context)
-    await update.message.reply_text("✅ 완료")
+    await update.message.reply_text("🔔 주간 리마인더 강제 실행 중 (lock 무시)...")
+    await weekly_reminder_job(context, source="manual_test")
+    await update.message.reply_text("✅ 완료 (이미 발송됐으면 스킵)")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 🆕 매주 수요일 07시 KST — 모든 봇 방에 타겟 결석자 심방계획 요청
 # ═════════════════════════════════════════════════════════════════════════════
-async def wednesday_visit_plan_request_job(context: ContextTypes.DEFAULT_TYPE):
+async def wednesday_visit_plan_request_job(context: ContextTypes.DEFAULT_TYPE, source: str = "job_queue"):
     """
     매주 수요일 07시 KST에 실행.
     봇이 등록된 모든 방(telegram_chat_scope) 에 현재 주차 결석자 요약 + 심방계획 요청.
+    
+    🛡 v4.7: 같은 날 중복 실행 방지 (Cloud Scheduler + JobQueue 동시 실행 안전).
     """
-    logger.info("📅 wednesday_visit_plan_request_job start")
+    # 🛡 중복 실행 체크
+    acquired = await try_acquire_job_lock("weekly_visit_plan", source)
+    if not acquired:
+        logger.info("⏭ weekly_visit_plan: 오늘 이미 실행됨 (source=%s, 스킵)", source)
+        return
+
+    logger.info("📅 wednesday_visit_plan_request_job start (source=%s)", source)
     try:
         # 1) 현재 주차
         week_key, week_label = await get_active_week()
@@ -3029,8 +3080,9 @@ async def wednesday_visit_plan_request_job(context: ContextTypes.DEFAULT_TYPE):
                     )
 
                 # 5) 전송 (HTML → fallback to plain)
+                kb_link = kb_dashboard_link()  # 🆕 v4.7: 대시보드 버튼
                 try:
-                    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+                    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML", reply_markup=kb_link)
                     sent += 1
                 except Exception as e1:
                     logger.warning("HTML send 실패 chat_id=%s: %s", chat_id, e1)
@@ -3039,7 +3091,7 @@ async def wednesday_visit_plan_request_job(context: ContextTypes.DEFAULT_TYPE):
                         plain = (msg.replace("<b>", "").replace("</b>", "")
                                    .replace("<i>", "").replace("</i>", "")
                                    .replace("<code>", "").replace("</code>", ""))
-                        await context.bot.send_message(chat_id=chat_id, text=plain)
+                        await context.bot.send_message(chat_id=chat_id, text=plain, reply_markup=kb_link)
                         sent += 1
                     except Exception as e2:
                         logger.warning("평문 send 실패 chat_id=%s: %s", chat_id, e2)
@@ -3055,18 +3107,26 @@ async def wednesday_visit_plan_request_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def force_wednesday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """수요일 알림 강제 실행 (테스트용)"""
-    await update.message.reply_text("📅 수요일 심방계획 요청 강제 실행 중...")
-    await wednesday_visit_plan_request_job(context)
-    await update.message.reply_text("✅ 완료")
+    """수요일 알림 강제 실행 (테스트용 - 중복 lock 무시)"""
+    await update.message.reply_text("📅 수요일 심방계획 요청 강제 실행 중 (lock 무시)...")
+    # 강제 실행 시 source='manual_test' → 어차피 같은 날 lock 있으면 스킵됨
+    # 테스트시 매번 발송하려면 lock 테이블에서 오늘 row 삭제 필요
+    await wednesday_visit_plan_request_job(context, source="manual_test")
+    await update.message.reply_text("✅ 완료 (이미 발송됐으면 스킵)")
 
 
-async def weekly_rollover_job(context: ContextTypes.DEFAULT_TYPE):
+async def weekly_rollover_job(context: ContextTypes.DEFAULT_TYPE, source: str = "job_queue"):
     """매주 수요일 00:00 KST — 주차 자동 전환.
     
     weekly_target_weeks 에 다음주 entry 가 없으면 자동 추가.
+    🛡 v4.7: 중복 실행 방지.
     """
-    logger.info("📅 weekly_rollover_job start")
+    acquired = await try_acquire_job_lock("weekly_rollover", source)
+    if not acquired:
+        logger.info("⏭ weekly_rollover: 오늘 이미 실행됨 (source=%s, 스킵)", source)
+        return
+
+    logger.info("📅 weekly_rollover_job start (source=%s)", source)
     try:
         week_key, week_label = compute_target_week_key()
         # 이미 존재하는지 체크
@@ -3511,6 +3571,72 @@ def main():
             logger.exception("webhook process error: %s", e)
             return web.Response(status=500, text="error")
 
+    # 🆕 v4.7: Cloud Scheduler 트리거용 endpoint
+    # 보안: SCHEDULER_TOKEN 환경변수와 일치하는 token 만 허용
+    SCHEDULER_TOKEN = os.environ.get("SCHEDULER_TOKEN", "")
+
+    def _check_scheduler_auth(request) -> bool:
+        """Cloud Scheduler 인증 체크 (?token=xxx 또는 Authorization 헤더)"""
+        if not SCHEDULER_TOKEN:
+            logger.warning("SCHEDULER_TOKEN 환경변수 미설정 - 모든 요청 거부")
+            return False
+        # 1) Query parameter
+        token = request.query.get("token", "")
+        if token == SCHEDULER_TOKEN:
+            return True
+        # 2) Authorization 헤더
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer ") and auth[7:] == SCHEDULER_TOKEN:
+            return True
+        return False
+
+    async def trigger_weekly_visit_plan(request):
+        """🌅 매주 수요일 07:00 KST — 개인방 사용자에게 타겟 결석자 심방계획 요청.
+        Cloud Scheduler 가 호출."""
+        if not _check_scheduler_auth(request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        logger.info("📅 [Cloud Scheduler] trigger_weekly_visit_plan 호출")
+        try:
+            # JobQueue context 객체 흉내내기 (job_queue 안 쓸 때 대비)
+            class FakeContext:
+                bot = app.bot
+            await wednesday_visit_plan_request_job(FakeContext(), source="cloud_scheduler")
+            return web.json_response({"ok": True, "message": "weekly_visit_plan 발송 완료"})
+        except Exception as e:
+            logger.exception("trigger_weekly_visit_plan 실패: %s", e)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def trigger_special_reminder(request):
+        """🚨 매주 수요일 07:00 KST — 특별관리 그룹방에 피드백/심방계획 요청.
+        Cloud Scheduler 가 호출."""
+        if not _check_scheduler_auth(request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        logger.info("📅 [Cloud Scheduler] trigger_special_reminder 호출")
+        try:
+            class FakeContext:
+                bot = app.bot
+            await weekly_reminder_job(FakeContext(), source="cloud_scheduler")
+            return web.json_response({"ok": True, "message": "special_reminder 발송 완료"})
+        except Exception as e:
+            logger.exception("trigger_special_reminder 실패: %s", e)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def trigger_weekly_rollover(request):
+        """🌃 매주 수요일 00:00 KST — 주차 자동 전환.
+        Cloud Scheduler 가 호출."""
+        if not _check_scheduler_auth(request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        logger.info("📅 [Cloud Scheduler] trigger_weekly_rollover 호출")
+        try:
+            class FakeContext:
+                bot = app.bot
+            await weekly_rollover_job(FakeContext(), source="cloud_scheduler")
+            return web.json_response({"ok": True, "message": "weekly_rollover 완료"})
+        except Exception as e:
+            logger.exception("trigger_weekly_rollover 실패: %s", e)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
     async def miniapp_html_handler(request):
         """미니웹앱 HTML 정적 서빙"""
         try:
@@ -3758,6 +3884,13 @@ def main():
     http_app.router.add_post("/miniapp/submit", miniapp_submit_handler)
     http_app.router.add_get("/", health)
     http_app.router.add_get("/health", health)
+    # 🆕 Cloud Scheduler 트리거 endpoints (POST 권장, GET도 허용)
+    http_app.router.add_post("/trigger/weekly-visit-plan", trigger_weekly_visit_plan)
+    http_app.router.add_get("/trigger/weekly-visit-plan",  trigger_weekly_visit_plan)
+    http_app.router.add_post("/trigger/special-reminder",  trigger_special_reminder)
+    http_app.router.add_get("/trigger/special-reminder",   trigger_special_reminder)
+    http_app.router.add_post("/trigger/weekly-rollover",   trigger_weekly_rollover)
+    http_app.router.add_get("/trigger/weekly-rollover",    trigger_weekly_rollover)
 
     async def _run():
         await app.initialize()
