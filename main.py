@@ -72,7 +72,7 @@ STEP_CHOICES = {
 }
 
 # ── 특별관리 4항목 ─────────────────────────────────────────────────────────────
-# 1번: 최초 1회만 · 2/3/4번: 매주 목요일 07시 초기화
+# 1번: 최초 1회만 · 2/3/4번: 매주 수요일 07시 초기화
 SP_ITEM_LABELS = {
     "item1_chat_invited":  "대책방 초대완료 (구역장·인섬교·강사·전도사·심방부사명자)",
     "item2_feedback_done": "금주 피드백 진행",
@@ -477,9 +477,56 @@ async def get_progress(week_key: str, row_id: str):
     return rows[0] if rows else None
 
 
+def _parse_visit_date_to_iso(raw: str) -> str | None:
+    """🆕 v4.7: 다양한 날짜 형식을 ISO (YYYY-MM-DD) 로 변환 (정렬용).
+    
+    인식 형식:
+    - 4/27, 4-27, 4.27 (월/일)
+    - 2026-4-27, 2026/4/27, 2026.4.27 (연-월-일)
+    - 4월 27일
+    - 2026년 4월 27일
+    """
+    if not raw:
+        return None
+    raw = raw.strip()
+    now_year = datetime.now(KST).year
+
+    # 1) 이미 YYYY-MM-DD
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", raw)
+    if m:
+        return raw
+
+    # 2) YYYY[-/.]M[-/.]D
+    m = re.match(r"^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$", raw)
+    if m:
+        y, mo, d = m.groups()
+        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+
+    # 3) M[/.−]D (현재 연도 사용)
+    m = re.match(r"^(\d{1,2})[/.\-](\d{1,2})$", raw)
+    if m:
+        mo, d = m.groups()
+        return f"{now_year:04d}-{int(mo):02d}-{int(d):02d}"
+
+    # 4) "4월 27일"
+    m = re.match(r"^(\d{1,2})월\s*(\d{1,2})일$", raw)
+    if m:
+        mo, d = m.groups()
+        return f"{now_year:04d}-{int(mo):02d}-{int(d):02d}"
+
+    # 5) "2026년 4월 27일"
+    m = re.match(r"^(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일$", raw)
+    if m:
+        y, mo, d = m.groups()
+        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+
+    return None
+
+
 async def upsert_progress(week_key: str, row_id: str, ctx: dict):
     raw_date = ctx.get("tmp_date") or ""
-    date_sort = raw_date if re.match(r"^\d{4}-\d{2}-\d{2}$", raw_date) else None
+    # 🆕 v4.7: 다양한 형식 → ISO 자동 변환
+    date_sort = _parse_visit_date_to_iso(raw_date)
     await sb_rpc("upsert_weekly_visit_progress", {
         "p_week_key":           week_key,
         "p_row_id":             row_id,
@@ -624,7 +671,7 @@ HELP_TEXT = (
     "   ② 금주 피드백 진행 (주간 리셋)\n"
     "   ③ 금주 심방예정일\n"
     "   ④ 금주 심방계획\n"
-    "매주 목요일 07:00 KST 에 미체크 항목 리마인더 발송\n\n"
+    "매주 수요일 07:00 KST 에 미체크 항목 리마인더 발송\n\n"
 
     "<b>📱 4️⃣ 미니앱 (개인 채팅에서만)</b>\n"
     "📝 결석자 심방 기록 (폼) 버튼 탭\n"
@@ -634,7 +681,7 @@ HELP_TEXT = (
 
     "<b>📅 자동 알림 스케줄</b>\n"
     "• <b>수요일 07:00 KST</b> → 모든 방에 이번 주 결석자 심방계획 요청\n"
-    "• <b>목요일 07:00 KST</b> → 특별관리 대상 미체크 항목 리마인더 (연속결석자 방)\n\n"
+    "• <b>수요일 07:00 KST</b> → 특별관리 대상 미체크 항목 리마인더 (연속결석자 방)\n\n"
 
     "<b>⌨️ 5️⃣ 명령어 모음</b> <i>(탭하면 복사)</i>\n"
     "• <code>/start</code> — 방 설정 + 메인 메뉴\n"
@@ -1998,17 +2045,19 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if step == "date":
             import re as _re
             patterns = [
-                r"^\d{1,2}[/.\-]\d{1,2}$",             # 4/27, 4.27, 4-27
-                r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$",     # 2026-04-27
-                r"^\d{1,2}월\s*\d{1,2}일$",             # 4월 27일
+                r"^\d{1,2}[/.\-]\d{1,2}$",                       # 4/27, 4.27, 4-27
+                r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$",              # 2026-04-27, 2026/4/27, 2026.4.27
+                r"^\d{1,2}월\s*\d{1,2}일$",                       # 4월 27일
+                r"^\d{4}년\s*\d{1,2}월\s*\d{1,2}일$",             # 2026년 4월 26일
             ]
             if not any(_re.match(p, text) for p in patterns):
                 await update.message.reply_text(
                     f"⚠️ *심방날짜 형식*이 올바르지 않습니다.\n\n"
                     f"허용되는 형식:\n"
-                    f"• `4/27` 또는 `4.27`\n"
-                    f"• `2026-04-27`\n"
-                    f"• `4월 27일`\n\n"
+                    f"• `4/27` 또는 `4-27` 또는 `4.27`\n"
+                    f"• `2026-04-27` 또는 `2026/4/27` 또는 `2026.4.27`\n"
+                    f"• `4월 27일`\n"
+                    f"• `2026년 4월 27일`\n\n"
                     f"입력된 값: `{md(text)}`\n"
                     f"다시 입력해주세요:",
                     parse_mode="Markdown",
@@ -2622,7 +2671,7 @@ async def _on_sp_pick(update: Update, chat_id: int, church: str, dept: str, name
         await q.edit_message_text(
             f"✅ <b>{_html.escape(str(name))}</b> 님을 <b>특별관리 대상</b>으로 등록했습니다.\n"
             f"이 방에서 감지를 시작합니다.\n\n"
-            f"매주 목요일 07:00 KST 에 "
+            f"매주 수요일 07:00 KST 에 "
             f"미체크 항목 리마인더가 이 방으로 발송됩니다.",
             parse_mode="HTML",
         )
@@ -2631,7 +2680,7 @@ async def _on_sp_pick(update: Update, chat_id: int, church: str, dept: str, name
         await q.message.reply_text(
             f"✅ {name} 님을 특별관리 대상으로 등록했습니다.\n"
             f"이 방에서 감지를 시작합니다.\n"
-            f"매주 목요일 07:00 KST 에 리마인더가 발송됩니다."
+            f"매주 수요일 07:00 KST 에 리마인더가 발송됩니다."
         )
 
     await save_ctx(
@@ -2674,14 +2723,16 @@ async def _show_sp_detail(update, chat_id: int, church: str, dept: str, name: st
     item4 = d.get("item4_visit_plan") or ""
 
     text = (
-        f"🚨 <b>특별관리: {_html.escape(str(name))}</b>\n"
-        f"{_html.escape(church)} / {_html.escape(dept)} / {_html.escape(region)} {_html.escape(zone)}\n"
+        f"🚨 <b>특별관리 대상자 {_html.escape(str(name))}님 피드백방</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📍 {_html.escape(church)} / {_html.escape(dept)} / {_html.escape(region)} {_html.escape(zone)}\n\n"
+        f"<i>이 그룹방은 그룹방이 삭제될 때까지 <b>{_html.escape(str(name))}</b>님 한 분을 위한 피드백 방입니다.</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{'✅' if item1 else '⬜️'} <b>1. 대책방 초대완료</b>\n"
         f"   (구역장·인섬교·강사·전도사·심방부사명자)\n"
         f"   <i>최초 1회만 체크 (주간 리셋 안 됨)</i>\n\n"
         f"{'✅' if item2 else '⬜️'} <b>2. 금주 피드백 진행</b>\n"
-        f"   <i>매주 목요일 07시 초기화</i>\n\n"
+        f"   <i>매주 수요일 07시 초기화</i>\n\n"
         f"📅 <b>3. 금주 심방예정일:</b> {_html.escape(str(item3)) if item3 else '<i>미입력</i>'}\n\n"
         f"📝 <b>4. 금주 심방계획:</b> {_html.escape(str(item4)) if item4 else '<i>미입력</i>'}"
     )
@@ -2863,7 +2914,7 @@ async def _on_sp_unregister_ctx(update: Update, chat_id: int):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 매주 목요일 07시 KST — 주간 리마인더 + 2/3/4번 리셋
+# 매주 수요일 07시 KST — 주간 리마인더 + 2/3/4번 리셋
 # ═════════════════════════════════════════════════════════════════════════════
 async def weekly_reminder_job(context: ContextTypes.DEFAULT_TYPE, source: str = "job_queue"):
     """🛡 v4.7: 중복 실행 방지."""
@@ -2901,7 +2952,7 @@ async def weekly_reminder_job(context: ContextTypes.DEFAULT_TYPE, source: str = 
 
             if unchecked:
                 msg = (
-                    f"🔔 *주간 리마인더* (목요일 07시)\n"
+                    f"🔔 *주간 리마인더* (수요일 07시)\n"
                     f"👤 *{md(name)}* ({md(dept)} / {md(region)} {md(zone)})\n\n"
                     f"미체크 항목:\n" + "\n".join(unchecked) +
                     f"\n\n/menu → 🚨 특별관리결석자 에서 업데이트하세요."
