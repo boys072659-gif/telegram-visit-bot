@@ -269,19 +269,24 @@ async def enrich_names(rows: list, church_key: str = "church", dept_key: str = "
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 주차 계산 (화요일 18시 KST 기준)
+# 주차 계산 (🔧 수요일 00시 KST 기준 — 매주 수요일 0시 자동 전환)
 # ═════════════════════════════════════════════════════════════════════════════
 def compute_target_week_key() -> tuple[str, str]:
-    """지금 시점 기준 타겟 주일 주차의 (week_key, week_label) 반환."""
+    """지금 시점 기준 타겟 주일 주차의 (week_key, week_label) 반환.
+    
+    수요일 00시 KST 를 기준으로 다음 주일을 타겟으로 함.
+    - 일/월/화: 이번 주 일요일이 타겟 (지난주차)
+    - 수~토: 이번 주 일요일이 타겟 (이번주차)
+    """
     now = datetime.now(KST)
     weekday = now.weekday()  # 0=월 … 6=일
-    hour = now.hour
 
+    # 🔧 수요일 00시 기준: 일~화는 지난 일요일, 수~토는 다가오는 일요일
     if weekday == 6:
-        diff = 0
-    elif weekday == 0 or (weekday == 1 and hour < 18):
+        diff = 0  # 일요일이면 오늘
+    elif weekday in (0, 1):  # 월, 화: 지난 일요일
         diff = -(weekday + 1)
-    else:
+    else:  # 수, 목, 금, 토: 다가오는 일요일
         diff = 6 - weekday
 
     sunday = (now + timedelta(days=diff)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -764,19 +769,28 @@ async def ensure_authorized(update: Update) -> bool:
     """
     승인 체크 + 미승인 시 안내 메시지 전송.
     승인되었으면 True, 안 되었으면 False 반환.
-    개인채팅(private)은 항상 승인.
+    🔧 개인방도 승인 필요 (관리자가 사전 등록한 user_id만 사용 가능).
     """
     chat = update.effective_chat
     if not chat:
         return False
-    # 개인방은 항상 허용
-    if chat.type == "private":
-        return True
 
     chat_id = chat.id
-    if await is_chat_authorized(chat_id):
-        await record_chat_access(chat_id)
-        return True
+
+    # 🔒 개인방은 user_id 기준으로 승인 체크 (개인방 chat_id == user_id)
+    if chat.type == "private":
+        # 봇 관리자는 무조건 승인
+        if await is_bot_admin_user(chat_id):
+            return True
+        # 일반 사용자는 chat_id 가 승인되었는지 체크
+        if await is_chat_authorized(chat_id):
+            await record_chat_access(chat_id)
+            return True
+    else:
+        # 그룹방
+        if await is_chat_authorized(chat_id):
+            await record_chat_access(chat_id)
+            return True
 
     # 미승인 - 안내 메시지 + 승인 신청 버튼
     chat_title = chat.title or chat.full_name or ""
@@ -1162,9 +1176,25 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb_reply_main(is_private_chat(update)),
     )
 
-    # 🛡 보안 체크 (그룹방만) — 승인되지 않은 방은 안내 메시지
+    # 🛡 보안 체크 (개인방·그룹방 모두) — 승인되지 않으면 안내
     is_private = is_private_chat(update)
-    if not is_private:
+    user = update.effective_user
+    is_admin = user and await is_bot_admin_user(user.id)
+
+    if is_private:
+        # 개인방: 봇 관리자는 무조건 통과 / 일반 사용자는 chat_id 승인 체크
+        if not is_admin:
+            authorized = await is_chat_authorized(chat_id)
+            if not authorized:
+                await update.message.reply_text(
+                    unauthorized_message(chat_id, chat_title),
+                    parse_mode="HTML",
+                    reply_markup=kb_request_approval(),
+                )
+                return
+            await record_chat_access(chat_id)
+    else:
+        # 그룹방
         authorized = await is_chat_authorized(chat_id)
         if not authorized:
             await update.message.reply_text(
@@ -3031,6 +3061,31 @@ async def force_wednesday_command(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text("✅ 완료")
 
 
+async def weekly_rollover_job(context: ContextTypes.DEFAULT_TYPE):
+    """매주 수요일 00:00 KST — 주차 자동 전환.
+    
+    weekly_target_weeks 에 다음주 entry 가 없으면 자동 추가.
+    """
+    logger.info("📅 weekly_rollover_job start")
+    try:
+        week_key, week_label = compute_target_week_key()
+        # 이미 존재하는지 체크
+        existing = await sb_get(
+            f"weekly_target_weeks?select=week_key&week_key=eq.{quote(week_key)}&limit=1"
+        )
+        if existing:
+            logger.info("주차 %s 이미 존재", week_key)
+            return
+        # 새 주차 등록
+        await sb_post("weekly_target_weeks", {
+            "week_key": week_key,
+            "week_label": week_label,
+        })
+        logger.info("✅ 주차 자동 전환 완료: %s (%s)", week_key, week_label)
+    except Exception as e:
+        logger.exception("주차 자동 전환 실패: %s", e)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 🆕 편의 명령어: /chatid, /approve, /deny + 승인 신청 버튼
 # ═════════════════════════════════════════════════════════════════════════════
@@ -3105,6 +3160,41 @@ async def request_approval_callback(update: Update, context: ContextTypes.DEFAUL
         )
         return
 
+    # 🆕 v4.6: scope 기반 라우팅
+    # 그룹방 scope (church/dept) 가 설정된 경우 → 해당 scope 관리자만 받음
+    # 개인방 또는 scope 미설정 → 지파관리자만 받음
+    target_scope = await get_chat_scope(chat_id)
+    target_church = (target_scope or {}).get("church")
+    target_dept = (target_scope or {}).get("dept")
+
+    def _admin_should_receive(admin: dict) -> bool:
+        """관리자가 이 신청을 받아야 하는지 판단."""
+        atype = admin.get("scope_type", "zipa")
+        achurch = admin.get("scope_church")
+        adept = admin.get("scope_dept")
+        # 지파관리자는 항상 받음
+        if atype == "zipa":
+            return True
+        # 신청 방의 scope 미설정이면 지파관리자만
+        if not target_church:
+            return False
+        # 교회관리자: 자기 교회 방만
+        if atype == "church":
+            return achurch == target_church
+        # 부서관리자: 자기 교회 자기 부서
+        if atype == "dept":
+            return achurch == target_church and (
+                not target_dept or adept == target_dept
+            )
+        return False
+
+    routed_admins = [a for a in admins if _admin_should_receive(a)]
+    if not routed_admins:
+        # fallback: 지파관리자에게 (위 로직상 항상 포함되지만, 안전장치)
+        routed_admins = [a for a in admins if a.get("scope_type") == "zipa"]
+        if not routed_admins:
+            routed_admins = admins  # 최후 수단
+
     # 관리자에게 DM 알림
     admin_msg = (
         "🔔 <b>새 방 승인 신청</b>\n"
@@ -3131,7 +3221,7 @@ async def request_approval_callback(update: Update, context: ContextTypes.DEFAUL
 
     delivered = 0
     failed = 0
-    for admin in admins:
+    for admin in routed_admins:
         admin_uid = admin.get("user_id")
         if not admin_uid:
             continue
@@ -3367,24 +3457,32 @@ def main():
 
     # 📅 스케줄 (python-telegram-bot v20: 월=0, 화=1, 수=2, 목=3, 금=4, 토=5, 일=6)
     if app.job_queue is not None:
-        # 🔔 [기존] 특별관리(연속결석) 주간 리마인더
-        # 기존: 화요일 19시 → 변경: 목요일 07시 KST
-        app.job_queue.run_daily(
-            weekly_reminder_job,
-            time=dtime(hour=7, minute=0, tzinfo=KST),
-            days=(3,),  # 목요일
-            name="weekly_special_reminder",
-        )
-        logger.info("📅 특별관리 리마인더: 매주 목요일 07:00 KST")
-
-        # 🆕 [신규] 매주 수요일 07시 KST - 모든 봇 방에 결석자 심방계획 요청
+        # 🆕 매주 수요일 07:00 KST — 봇 사용자(개인방) 모두에게 타겟 결석자 심방계획 요청
         app.job_queue.run_daily(
             wednesday_visit_plan_request_job,
             time=dtime(hour=7, minute=0, tzinfo=KST),
             days=(2,),  # 수요일
-            name="wednesday_visit_plan_request",
+            name="wednesday_personal_visit_plan",
         )
-        logger.info("📅 수요일 심방계획 요청: 매주 수요일 07:00 KST")
+        logger.info("📅 [매주 수요일 07:00 KST] 개인방 타겟 결석자 심방계획 요청")
+
+        # 🆕 매주 수요일 07:00 KST — 특별관리 그룹방에 피드백/심방계획 요청
+        app.job_queue.run_daily(
+            weekly_reminder_job,
+            time=dtime(hour=7, minute=0, tzinfo=KST),
+            days=(2,),  # 수요일
+            name="wednesday_special_reminder",
+        )
+        logger.info("📅 [매주 수요일 07:00 KST] 특별관리 그룹방 피드백 회의 요청")
+
+        # 🆕 매주 수요일 00:00 KST — 주차 자동 전환 (선택적)
+        app.job_queue.run_daily(
+            weekly_rollover_job,
+            time=dtime(hour=0, minute=0, tzinfo=KST),
+            days=(2,),  # 수요일
+            name="wednesday_weekly_rollover",
+        )
+        logger.info("📅 [매주 수요일 00:00 KST] 주차 자동 전환")
     else:
         logger.warning("⚠ JobQueue unavailable")
 
