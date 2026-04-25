@@ -1043,12 +1043,10 @@ async def diagnose_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 특별관리 그룹당 1명 제한 확인 로직
+# 특별관리 방별 1명 제한 확인 로직 (1:1 방 포함)
 # ═════════════════════════════════════════════════════════════════════════════
 async def _handle_existing_group_sp(update: Update, chat_id: int, send_new: bool) -> bool:
-    """그룹방이 이미 특별관리방으로 지정된 경우, 해당 결석자 상세화면으로 즉시 이동"""
-    if update.effective_chat.type == "private":
-        return False
+    """방(그룹/1:1 모두)이 이미 특별관리방으로 지정된 경우, 해당 결석자 상세화면으로 즉시 이동"""
     try:
         existing = await sb_get(f"special_management_targets?select=dept,name,phone_last4&monitor_chat_id=eq.{chat_id}&limit=1")
         if existing:
@@ -1883,6 +1881,16 @@ async def _on_sp_pick(update: Update, chat_id: int, church: str, dept: str, name
     q = update.callback_query
     chat = update.effective_chat
 
+    # 1. 중복 선정 방지: 이 방이 이미 다른 사람을 관리 중인지 확인
+    try:
+        existing = await sb_get(f"special_management_targets?select=name&monitor_chat_id=eq.{chat_id}&limit=1")
+        if existing:
+            if existing[0].get("name") != name:
+                await q.answer("⚠️ 이 방은 이미 다른 대상자의 특별관리방으로 지정되었습니다. 1방당 1명만 가능합니다.", show_alert=True)
+                return
+    except Exception:
+        pass
+
     rows = await sb_get(f"weekly_visit_targets?select=name,region_name,zone_name,church,dept,phone_last4&dept=eq.{quote(dept)}&name=eq.{quote(name)}" + (f"&phone_last4=eq.{quote(phone)}" if phone else "") + "&limit=1")
     if rows:
         enriched = await enrich_names(rows)
@@ -2492,14 +2500,18 @@ def main():
 
         if not name: return web.json_response({"ok": False, "error": "이름은 필수입니다"}, status=400)
 
+        # 🚨 개선점: 앞 글자로 와일드카드 검색 후, Python에서 실제 마스킹 이름을 복구하여 대조
+        first_char = name[0]
+
         def _build_path(week_key, zone_value=None):
-            p = f"weekly_visit_targets?select=row_id,week_key,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count&week_key=eq.{quote(week_key)}&name=eq.{quote(name)}"
+            # ilike 연산자를 사용해 앞 글자로 시작하는 사람 전부 가져옴
+            p = f"weekly_visit_targets?select=row_id,week_key,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count&week_key=eq.{quote(week_key)}&name=ilike.{quote(first_char + '%')}"
             if phone:  p += f"&phone_last4=eq.{quote(phone)}"
             if church: p += f"&church=eq.{quote(church)}"
             if dept:   p += f"&dept=eq.{quote(dept)}"
             if region: p += f"&region_name=eq.{quote(region)}"
             if zone_value: p += f"&zone_name=eq.{quote(zone_value)}"
-            p += "&limit=5"
+            p += "&limit=50"
             return p
 
         try:
@@ -2514,7 +2526,8 @@ def main():
                     if wk and wk not in weeks_to_try: weeks_to_try.append(wk)
             except Exception: pass
 
-            rows = []
+            target_info = None
+
             for wk in weeks_to_try:
                 if zone:
                     zone_norm = normalize_zone(zone)
@@ -2525,18 +2538,24 @@ def main():
                         if zone_alt != zone and zone_alt != zone_norm: rows = await sb_get(_build_path(wk, zone_alt))
                 else:
                     rows = await sb_get(_build_path(wk, None))
-                if rows: break
+                
+                if rows:
+                    enriched = await enrich_names(rows)
+                    for r in enriched:
+                        # 실명으로 복구된 이름(name)이나 원래 마스킹된 이름(_original_name)이 검색어와 일치하는지 확인
+                        if r.get("name") == name or r.get("_original_name") == name:
+                            target_info = r
+                            break
+                
+                if target_info: break
 
-            if not rows: return web.json_response({"ok": True, "target": None, "progress": None})
+            if not target_info:
+                return web.json_response({"ok": True, "target": None, "progress": None})
 
-            target = rows[0]
-            enriched = await enrich_names([target])
-            if enriched: target = enriched[0]
-
-            prog_rows = await sb_get(f"weekly_visit_progress?select=*&week_key=eq.{quote(target['week_key'])}&row_id=eq.{quote(target['row_id'])}&limit=1")
+            prog_rows = await sb_get(f"weekly_visit_progress?select=*&week_key=eq.{quote(target_info['week_key'])}&row_id=eq.{quote(target_info['row_id'])}&limit=1")
             progress = prog_rows[0] if prog_rows else None
 
-            return web.json_response({"ok": True, "target": target, "progress": progress})
+            return web.json_response({"ok": True, "target": target_info, "progress": progress})
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
 
