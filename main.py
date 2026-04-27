@@ -269,25 +269,27 @@ async def enrich_names(rows: list, church_key: str = "church", dept_key: str = "
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 주차 계산 (🔧 수요일 00시 KST 기준 — 매주 수요일 0시 자동 전환)
+# 주차 계산 (🆕 v5.1 일요일 기준 — 항상 직전 일요일이 속한 주차)
 # ═════════════════════════════════════════════════════════════════════════════
 def compute_target_week_key() -> tuple[str, str]:
     """지금 시점 기준 타겟 주일 주차의 (week_key, week_label) 반환.
     
-    수요일 00시 KST 를 기준으로 다음 주일을 타겟으로 함.
-    - 일/월/화: 이번 주 일요일이 타겟 (지난주차)
-    - 수~토: 이번 주 일요일이 타겟 (이번주차)
+    🆕 v5.1: 일요일(주일) 기준 — 항상 직전(또는 당일) 일요일이 속한 주차
+    예시:
+      4/19(일) → 4월 3주차 (당일 일요일)
+      4/20(월) → 4월 3주차 (어제가 일요일)
+      4/22(수) → 4월 3주차 (4/19이 직전 일요일) ← 핵심!
+      4/26(일) → 4월 4주차 (당일 일요일)
     """
     now = datetime.now(KST)
     weekday = now.weekday()  # 0=월 … 6=일
 
-    # 🔧 수요일 00시 기준: 일~화는 지난 일요일, 수~토는 다가오는 일요일
+    # 🆕 v5.1: 항상 직전(또는 당일) 일요일을 찾음
+    # 일요일이면 그날, 그외엔 (weekday+1)일 전이 일요일
     if weekday == 6:
         diff = 0  # 일요일이면 오늘
-    elif weekday in (0, 1):  # 월, 화: 지난 일요일
-        diff = -(weekday + 1)
-    else:  # 수, 목, 금, 토: 다가오는 일요일
-        diff = 6 - weekday
+    else:
+        diff = -(weekday + 1)  # 월=−1, 화=−2, … 토=−7
 
     sunday = (now + timedelta(days=diff)).replace(hour=0, minute=0, second=0, microsecond=0)
     year, month = sunday.year, sunday.month
@@ -305,7 +307,8 @@ def compute_target_week_key() -> tuple[str, str]:
         week_no = 1
 
     week_key = f"{year}-{month:02d}-w{week_no}"
-    week_label = f"{year}년 {month}월 {week_no}주차"
+    # 🆕 v5.5: label = ISO 날짜 (그 주의 일요일)
+    week_label = sunday.strftime('%Y-%m-%d')
     return week_key, week_label
 
 
@@ -779,6 +782,20 @@ async def is_chat_authorized(chat_id: int) -> bool:
         return False
 
 
+async def get_chat_status(chat_id: int) -> str:
+    """🆕 v4.7: 방의 승인 상태 정확히 판별
+    Returns: 'active' (승인+활성), 'blocked' (승인됐지만 차단됨), 'none' (미승인/없음)
+    """
+    try:
+        rows = await sb_get(f"bot_authorized_chats?select=is_active&chat_id=eq.{chat_id}&limit=1")
+        if not rows:
+            return 'none'
+        return 'active' if bool(rows[0].get('is_active')) else 'blocked'
+    except Exception as e:
+        logger.warning("get_chat_status 실패: %s", e)
+        return 'none'
+
+
 async def record_chat_access(chat_id: int):
     """승인된 방의 접근 기록 (감사 로그)."""
     try:
@@ -800,6 +817,22 @@ def unauthorized_message(chat_id: int, chat_title: str = "") -> str:
         f"• 방 이름: {_html.escape(chat_title or '(제목없음)')}\n\n"
         f"👉 <b>아래 🙏 승인 신청하기 버튼을 누르시면</b>\n"
         f"관리자에게 자동으로 승인 요청이 전달됩니다."
+    )
+
+
+def blocked_message(chat_id: int, chat_title: str = "") -> str:
+    """🆕 v4.7: 차단된(비활성화된) 방에 표시할 안내 메시지."""
+    import html as _html
+    return (
+        "🚫 <b>이 방은 관리자에 의해 차단되었습니다</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"이 방에서는 봇 사용이 일시 중단된 상태입니다.\n"
+        f"기존 데이터는 보존되어 있으니, 재활성화 시 즉시 사용 가능합니다.\n\n"
+        f"📋 <b>이 방 정보</b>:\n"
+        f"• Chat ID: <code>{chat_id}</code>\n"
+        f"• 방 이름: {_html.escape(chat_title or '(제목없음)')}\n\n"
+        f"👉 <b>아래 🙏 재활성화 신청 버튼을 누르시면</b>\n"
+        f"관리자에게 재활성화 요청이 전달됩니다."
     )
 
 
@@ -902,10 +935,19 @@ async def ensure_authorized(update: Update) -> bool:
             await record_chat_access(chat_id)
             return True
 
-    # 미승인 - 안내 메시지 + 승인 신청 버튼
+    # 미승인 또는 차단 — 차단인지 미승인인지 구분해서 다른 메시지
     chat_title = chat.title or chat.full_name or ""
-    msg = unauthorized_message(chat_id, chat_title)
-    kb = kb_request_approval()
+    status = await get_chat_status(chat_id)
+    if status == 'blocked':
+        # 🚫 차단된 방
+        msg = blocked_message(chat_id, chat_title)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🙏 재활성화 신청", callback_data="request_approval")]
+        ])
+    else:
+        # 🔒 미승인 방
+        msg = unauthorized_message(chat_id, chat_title)
+        kb = kb_request_approval()
     try:
         if update.message:
             await update.message.reply_text(msg, parse_mode="HTML", reply_markup=kb)
