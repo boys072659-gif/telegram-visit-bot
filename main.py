@@ -571,7 +571,8 @@ if not MINIAPP_URL:
         MINIAPP_URL = _webhook.rsplit("/", 1)[0] + "/miniapp"
 
 # 🆕 v4.7: 웹 대시보드 URL (알림 메시지의 버튼 링크)
-DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "").strip()
+# 🆕 v5.8: 디폴트 대시보드 URL (환경변수 우선, 없으면 GitHub Pages)
+DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "https://boys072659-gif.github.io/absentee-dashboard/").strip()
 
 
 def kb_reply_main(is_private: bool = True) -> ReplyKeyboardMarkup:
@@ -608,6 +609,12 @@ def kb_main_menu(is_private: bool = True) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(
             "📝 결석자 심방 기록 (미니웹앱)",
             web_app=WebAppInfo(url=MINIAPP_URL)
+        )])
+    # 🆕 v5.8: 개인방엔 웹 대시보드 버튼 자동 추가
+    if is_private and DASHBOARD_URL:
+        rows.append([InlineKeyboardButton(
+            "📊 웹 대시보드 열기",
+            url=DASHBOARD_URL,
         )])
     rows += [
         [InlineKeyboardButton("📘 사용법 (도움말)",    callback_data="m:help")],
@@ -1151,7 +1158,7 @@ def kb_setup_region() -> InlineKeyboardMarkup:
 def kb_setup_zone() -> InlineKeyboardMarkup:
     """구역 입력 (선택) — 지역까지만으로도 완료 가능"""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏭ 지역까지만 완료 (구역 없이)", callback_data="scope_stop:region")],
+        [InlineKeyboardButton("✅ 구역 없이 완료 (지역까지)", callback_data="scope_stop:region")],
         [InlineKeyboardButton("◀ 지역 다시 입력", callback_data="scope_setup_back_region")],
         [InlineKeyboardButton("❌ 취소", callback_data="flow_cancel")],
     ])
@@ -1233,12 +1240,16 @@ async def _on_scope_dept(update: Update, chat_id: int, dept: str):
     await save_ctx(chat_id, church_filter=church, dept_filter=dept,
                    editing_step="awaiting_scope_region_text")
     await q.edit_message_text(
-        f"✅ *① 교회*: {md(church)}\n"
-        f"✅ *② 부서*: {md(dept)}\n\n"
-        f"*③ 지역* 이름을 입력하세요. (필수)\n"
-        f"예) `강북`, `강남`, `노원`, `성북`, `중랑`, `대학`\n\n"
-        f"⚠️ _지역까지는 반드시 설정해야 합니다._\n"
-        f"_구역까지 더 좁히려면 지역 입력 후 다음 화면에서 선택._",
+        f"📋 *방 범위 설정 (3/4 단계)*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"1️⃣ ✅ *교회*: {md(church)}\n"
+        f"2️⃣ ✅ *부서*: {md(dept)}\n"
+        f"3️⃣ ⏳ *지역* (필수) ← 지금 단계\n"
+        f"4️⃣ ⏸ *구역* (선택)\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📍 *지역 이름을 입력해주세요*\n\n"
+        f"예시: `강북` `강남` `노원` `성북` `중랑` `대학`\n\n"
+        f"💡 _지역까지는 반드시 설정해야 메뉴 진입 가능합니다._",
         parse_mode="Markdown",
         reply_markup=kb_setup_region(),
     )
@@ -1334,12 +1345,18 @@ async def _on_scope_text_input(update: Update, chat_id: int, text: str):
         dept = ctx.get("dept_filter") or ""
         await safe_reply_text(
             update.message,
-            f"✅ *① 교회*: {md(church)}\n"
-            f"✅ *② 부서*: {md(dept)}\n"
-            f"✅ *③ 지역*: {md(region)}\n\n"
-            f"*④ 구역* 이름을 입력하세요. (선택)\n"
-            f"예) `1-1`, `1팀1`, `2-3`\n\n"
-            f"💡 지역까지만 완료하려면 아래 `⏭ 지역까지만 완료` 버튼",
+            f"📋 *방 범위 설정 (4/4 단계)*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"1️⃣ ✅ *교회*: {md(church)}\n"
+            f"2️⃣ ✅ *부서*: {md(dept)}\n"
+            f"3️⃣ ✅ *지역*: {md(region)}\n"
+            f"4️⃣ ⏳ *구역* (선택) ← 지금 단계\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🏘 *구역까지 입력하시려면 구역 이름을 입력*\n\n"
+            f"예시: `1-1` `1팀1` `2-3` `사랑-1` `노민-2`\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏭ *구역 없이 마치려면 아래 [지역까지만 완료] 버튼*\n"
+            f"_(구역까지 설정하면 본인 구역 결석자만 표시됨)_",
             parse_mode="Markdown",
             reply_markup=kb_setup_zone(),
         )
@@ -1436,27 +1453,56 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2) 방 scope 확인 — 미설정이면 setup 유도
     scope = await get_chat_scope(chat_id)
-    if not scope:
-        if is_private:
+    
+    # 🆕 v5.8: 개인방 / 그룹방 둘 다 — 지역/구역까지 완전히 설정해야 메뉴 진입
+    #   개인방의 경우, 부서까지만 설정되어 있으면 결석자 목록이 너무 많아서
+    #   봇이 버벅거림 → 지역/구역까지 의무 설정
+    scope_complete = scope and scope.get("church") and scope.get("dept") and scope.get("region_name")
+    
+    if not scope_complete:
+        if scope and scope.get("church") and scope.get("dept"):
+            # 부서까지는 설정됨 (승인 전 단계에서 설정한 것) → 지역 추가 안내
+            dashboard_btn = []
+            if is_private and DASHBOARD_URL:
+                dashboard_btn.append([InlineKeyboardButton("📊 웹 대시보드 열기", url=DASHBOARD_URL)])
+            
             await update.message.reply_text(
-                "🏠 *메인 메뉴*",
-                parse_mode="Markdown",
-                reply_markup=kb_main_menu(is_private),
+                f"✅ <b>이 방은 승인되었습니다!</b>\n\n"
+                f"📋 <b>방 범위 설정 (2/4 완료)</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"1️⃣ ✅ 교회: {scope.get('church')}\n"
+                f"2️⃣ ✅ 부서: {scope.get('dept')}\n"
+                f"3️⃣ ⏳ <b>지역 (필수)</b> ← 다음 단계\n"
+                f"4️⃣ ⏸ 구역 (선택)\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📍 <b>지역 설정이 필요합니다</b>\n\n"
+                f"부서 단위로는 결석자가 너무 많아 봇이 느려집니다.\n"
+                f"<b>지역</b>까지 설정하면 본인 담당 결석자만 빠르게 표시됩니다.\n"
+                f"(구역은 선택 — 더 좁히고 싶으면 입력)\n\n"
+                f"👇 아래 [📍 지역 설정 시작] 버튼을 눌러주세요",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📍 지역 설정 시작", callback_data="scope_setup_back_region")],
+                    *dashboard_btn,
+                    [InlineKeyboardButton("📘 사용법", callback_data="show_help")],
+                ]),
             )
         else:
+            # scope 자체가 없음 (이런 경우는 거의 없지만 안전장치)
             await update.message.reply_text(
                 f"✅ 이 방은 승인되었습니다.\n\n"
-                f"📌 *담당 범위 설정이 필요합니다.*\n\n"
-                f"이 방에서 관리할 *교회 / 부서 / 지역 / 구역*을 설정해야\n"
+                f"📌 <b>담당 범위 설정이 필요합니다.</b>\n\n"
+                f"이 방에서 관리할 <b>교회 / 부서 / 지역 / 구역</b>을 설정해야\n"
                 f"결석자 목록이 해당 범위로 자동 필터링됩니다.\n\n"
-                f"아래 `🔧 방 범위 설정` 버튼을 눌러 시작하세요 👇",
-                parse_mode="Markdown",
+                f"아래 [🔧 방 범위 설정] 버튼을 눌러 시작하세요 👇",
+                parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔧 방 범위 설정", callback_data="scope_setup")],
                     [InlineKeyboardButton("📘 사용법", callback_data="show_help")],
                 ]),
             )
     else:
+        # scope 완전 설정됨 → 메인 메뉴 (개인방이면 메뉴에 대시보드 버튼 자동 포함)
         await update.message.reply_text(
             f"📌 *이 방의 담당 범위*: {md(scope_label(scope))}\n\n"
             f"🏠 *메인 메뉴*",
@@ -3916,15 +3962,63 @@ async def admin_approve_callback(update: Update, context: ContextTypes.DEFAULT_T
         parse_mode="HTML",
     )
     try:
-        await context.bot.send_message(
-            chat_id=target_chat_id,
-            text=(
+        # 🆕 v5.8: 승인 후 scope 상태 따라 다음 단계 안내
+        existing_scope = await get_chat_scope(target_chat_id)
+        has_partial = existing_scope and existing_scope.get("church") and existing_scope.get("dept")
+        has_complete = has_partial and existing_scope.get("region_name")
+        
+        if has_complete:
+            # 이미 모든 설정 완료
+            notify_text = (
                 f"✅ <b>이 방이 승인되었습니다!</b>\n\n"
                 f"승인자: {_html.escape(admin_name)}\n\n"
+                f"📌 담당 범위: {_html.escape(scope_label(existing_scope))}\n\n"
                 f"이제 <code>/start</code> 로 봇 사용을 시작하세요."
-            ),
-            parse_mode="HTML",
-        )
+            )
+            kb_after = None
+        elif has_partial:
+            # 교회+부서까지만 설정됨 → 지역/구역 추가 설정 안내
+            notify_text = (
+                f"✅ <b>이 방이 승인되었습니다!</b>\n\n"
+                f"승인자: {_html.escape(admin_name)}\n\n"
+                f"📋 <b>현재 진행 상황</b>:\n"
+                f"1️⃣ ✅ 교회: {existing_scope.get('church')}\n"
+                f"2️⃣ ✅ 부서: {existing_scope.get('dept')}\n"
+                f"3️⃣ ⏳ 지역 (필수) ← 다음 단계\n"
+                f"4️⃣ ⏸ 구역 (선택)\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📍 <b>지역 설정이 필요합니다</b>\n\n"
+                f"부서 단위로는 결석자가 너무 많아 봇이 느려집니다.\n"
+                f"<b>지역</b>까지 설정하면 본인 담당 결석자만 빠르게 표시됩니다.\n"
+                f"(구역은 선택 — 더 좁히고 싶으면 입력)\n\n"
+                f"👇 아래 버튼을 누르거나 <code>/start</code> 로 시작"
+            )
+            kb_buttons = [[InlineKeyboardButton("📍 지역 설정 시작", callback_data="scope_setup_back_region")]]
+            # 🆕 개인방이면 대시보드 버튼도 추가
+            if target_chat_id > 0 and DASHBOARD_URL:  # 개인방은 chat_id > 0
+                kb_buttons.append([InlineKeyboardButton("📊 웹 대시보드 열기", url=DASHBOARD_URL)])
+            kb_after = InlineKeyboardMarkup(kb_buttons)
+        else:
+            # scope 자체가 없음 (예전에 승인 신청 한 옛 방)
+            notify_text = (
+                f"✅ <b>이 방이 승인되었습니다!</b>\n\n"
+                f"승인자: {_html.escape(admin_name)}\n\n"
+                f"📌 <b>방 범위 설정이 필요합니다</b>\n"
+                f"교회 / 부서 / 지역 / 구역을 차례로 설정해주세요.\n\n"
+                f"<code>/start</code> 로 시작"
+            )
+            kb_after = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔧 방 범위 설정", callback_data="scope_setup")]
+            ])
+        
+        send_kwargs = {
+            "chat_id": target_chat_id,
+            "text": notify_text,
+            "parse_mode": "HTML",
+        }
+        if kb_after is not None:
+            send_kwargs["reply_markup"] = kb_after
+        await context.bot.send_message(**send_kwargs)
     except Exception as e:
         logger.info("승인 방 알림 실패: %s", e)
 
