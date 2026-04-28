@@ -282,14 +282,28 @@ def compute_target_week_key() -> tuple[str, str]:
       4/26(일) → 4월 4주차 (당일 일요일)
     """
     now = datetime.now(KST)
-    weekday = now.weekday()  # 0=월 … 6=일
+    weekday = now.weekday()  # Python: 0=월, 1=화, 2=수, 3=목, 4=금, 5=토, 6=일
 
-    # 🆕 v5.1: 항상 직전(또는 당일) 일요일을 찾음
-    # 일요일이면 그날, 그외엔 (weekday+1)일 전이 일요일
+    # 🆕 v5.5: 사용자 운영 흐름 정확히 반영
+    #   "수요일 00시 KST" 가 새 주차 데이터 업로드 시작점
+    #
+    #   화요일 23:59 까지: 지난 주 일요일 데이터 처리 중
+    #   수요일 00:00 부터: 이번 주 일요일 데이터 처리 시작
+    #
+    #   예시:
+    #     4/22(수) 00시 ~ 4/28(화) 23시 → 4/19 일요일 데이터
+    #     4/29(수) 00시 ~ 5/5(화) 23시  → 4/26 일요일 데이터
     if weekday == 6:
-        diff = 0  # 일요일이면 오늘
+        # 일요일 → 그 일요일은 새 주차 시작점이지만,
+        # 아직 수요일 전이라 데이터는 지난 주일 처리 중
+        diff = -7
+    elif weekday == 0 or weekday == 1:
+        # 월(0), 화(1) → 지난 주 일요일
+        # 직전 일요일 = -(weekday+1), 그 한 주 전 = -(weekday+1) - 7
+        diff = -(weekday + 1) - 7
     else:
-        diff = -(weekday + 1)  # 월=−1, 화=−2, … 토=−7
+        # 수(2), 목(3), 금(4), 토(5) → 이번 주 일요일 (직전)
+        diff = -(weekday + 1)
 
     sunday = (now + timedelta(days=diff)).replace(hour=0, minute=0, second=0, microsecond=0)
     year, month = sunday.year, sunday.month
@@ -815,8 +829,8 @@ def unauthorized_message(chat_id: int, chat_title: str = "") -> str:
         f"📋 <b>이 방 정보</b>:\n"
         f"• Chat ID: <code>{chat_id}</code>\n"
         f"• 방 이름: {_html.escape(chat_title or '(제목없음)')}\n\n"
-        f"👉 <b>아래 🙏 승인 신청하기 버튼을 누르시면</b>\n"
-        f"관리자에게 자동으로 승인 요청이 전달됩니다."
+        f"👇 <b>먼저 소속 교회를 선택해주세요</b>\n"
+        f"   (소속 정보 설정 후 → 승인 신청 가능)"
     )
 
 
@@ -837,9 +851,61 @@ def blocked_message(chat_id: int, chat_title: str = "") -> str:
 
 
 def kb_request_approval() -> InlineKeyboardMarkup:
-    """승인 신청 버튼 키보드"""
+    """승인 신청 버튼 키보드 (이미 scope 설정된 경우)"""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🙏 승인 신청하기", callback_data="request_approval")]
+    ])
+
+
+# 🆕 v5.8: 승인 전 scope 선택 — 교회 선택 키보드
+def kb_pre_approval_church() -> InlineKeyboardMarkup:
+    """승인 신청 전 — 소속 교회 선택"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏛 서울교회",   callback_data="prereq_church:서울교회"),
+            InlineKeyboardButton("🏛 포천교회",   callback_data="prereq_church:포천교회"),
+        ],
+        [
+            InlineKeyboardButton("🏛 구리교회",   callback_data="prereq_church:구리교회"),
+            InlineKeyboardButton("🏛 동대문교회", callback_data="prereq_church:동대문교회"),
+        ],
+        [
+            InlineKeyboardButton("🏛 의정부교회", callback_data="prereq_church:의정부교회"),
+        ],
+    ])
+
+
+# 🆕 v5.8: 부서 선택 키보드
+def kb_pre_approval_dept(church: str) -> InlineKeyboardMarkup:
+    """승인 신청 전 — 소속 부서 선택"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👔 자문회", callback_data=f"prereq_dept:{church}:자문회"),
+            InlineKeyboardButton("👨 장년회", callback_data=f"prereq_dept:{church}:장년회"),
+        ],
+        [
+            InlineKeyboardButton("👩 부녀회", callback_data=f"prereq_dept:{church}:부녀회"),
+            InlineKeyboardButton("🧑 청년회", callback_data=f"prereq_dept:{church}:청년회"),
+        ],
+        [
+            InlineKeyboardButton("⛪ 교역자", callback_data=f"prereq_dept:{church}:교역자"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ 교회 다시 선택", callback_data="prereq_back_church"),
+        ],
+    ])
+
+
+# 🆕 v5.8: 최종 확인 키보드 (승인 신청 버튼)
+def kb_final_approval(church: str, dept: str) -> InlineKeyboardMarkup:
+    """승인 신청 전 — 최종 확인 후 승인 신청"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🙏 승인 신청하기", callback_data="request_approval"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ 부서 다시 선택", callback_data=f"prereq_back_dept:{church}"),
+        ],
     ])
 
 
@@ -947,7 +1013,12 @@ async def ensure_authorized(update: Update) -> bool:
     else:
         # 🔒 미승인 방
         msg = unauthorized_message(chat_id, chat_title)
-        kb = kb_request_approval()
+        # 🆕 v5.8: scope 이미 있으면 바로 승인 버튼, 없으면 교회 선택부터
+        existing_scope = await get_chat_scope(chat_id)
+        if existing_scope and existing_scope.get("church"):
+            kb = kb_request_approval()
+        else:
+            kb = kb_pre_approval_church()
     try:
         if update.message:
             await update.message.reply_text(msg, parse_mode="HTML", reply_markup=kb)
@@ -1338,10 +1409,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin:
             authorized = await is_chat_authorized(chat_id)
             if not authorized:
+                # 🆕 v5.8: scope 미설정시 교회 선택부터
+                existing_scope = await get_chat_scope(chat_id)
+                kb = kb_request_approval() if existing_scope and existing_scope.get("church") else kb_pre_approval_church()
                 await update.message.reply_text(
                     unauthorized_message(chat_id, chat_title),
                     parse_mode="HTML",
-                    reply_markup=kb_request_approval(),
+                    reply_markup=kb,
                 )
                 return
             await record_chat_access(chat_id)
@@ -1349,10 +1423,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 그룹방
         authorized = await is_chat_authorized(chat_id)
         if not authorized:
+            # 🆕 v5.8: scope 미설정시 교회 선택부터
+            existing_scope = await get_chat_scope(chat_id)
+            kb = kb_request_approval() if existing_scope and existing_scope.get("church") else kb_pre_approval_church()
             await update.message.reply_text(
                 unauthorized_message(chat_id, chat_title),
                 parse_mode="HTML",
-                reply_markup=kb_request_approval(),
+                reply_markup=kb,
             )
             return
         await record_chat_access(chat_id)
@@ -1490,6 +1567,19 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data.startswith("admin_deny:"):
         await admin_deny_callback(update, context)
+        return
+    # 🆕 v5.8: 승인 전 교회/부서 선택 콜백
+    if data.startswith("prereq_church:"):
+        await prereq_church_callback(update, context)
+        return
+    if data.startswith("prereq_dept:"):
+        await prereq_dept_callback(update, context)
+        return
+    if data == "prereq_back_church":
+        await prereq_back_church_callback(update, context)
+        return
+    if data.startswith("prereq_back_dept:"):
+        await prereq_back_dept_callback(update, context)
         return
 
     await q.answer()
@@ -3431,6 +3521,152 @@ async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode="HTML")
 
 
+async def prereq_church_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🆕 v5.8: 승인 전 교회 선택 → 부서 선택 키보드 표시"""
+    q = update.callback_query
+    await q.answer()
+    
+    data = q.data  # "prereq_church:서울교회"
+    church = data.split(":", 1)[1] if ":" in data else ""
+    if not church:
+        await q.edit_message_text("❌ 잘못된 선택입니다.")
+        return
+
+    chat_id = update.effective_chat.id
+    chat_title = update.effective_chat.title or update.effective_chat.full_name or ""
+    
+    msg = (
+        "🔒 <b>승인되지 않은 방입니다</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📋 <b>이 방 정보</b>:\n"
+        f"• Chat ID: <code>{chat_id}</code>\n"
+        f"• 방 이름: {chat_title}\n\n"
+        f"✅ <b>1단계: 소속 교회</b> → {church}\n\n"
+        f"👇 <b>2단계: 소속 부서를 선택해주세요</b>"
+    )
+    
+    try:
+        await q.edit_message_text(
+            msg,
+            parse_mode="HTML",
+            reply_markup=kb_pre_approval_dept(church),
+        )
+    except Exception as e:
+        logger.warning("prereq_church_callback edit 실패: %s", e)
+
+
+async def prereq_dept_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🆕 v5.8: 승인 전 부서 선택 → scope 저장 + 최종 승인 신청 키보드"""
+    q = update.callback_query
+    await q.answer()
+    
+    data = q.data  # "prereq_dept:서울교회:청년회"
+    parts = data.split(":")
+    if len(parts) < 3:
+        await q.edit_message_text("❌ 잘못된 선택입니다.")
+        return
+    church = parts[1]
+    dept = parts[2]
+    
+    chat_id = update.effective_chat.id
+    chat_title = update.effective_chat.title or update.effective_chat.full_name or ""
+    user = update.effective_user
+    owner_name = (user.full_name if user else "") or (user.username if user else "")
+    
+    # 🆕 scope 저장 (지역/구역은 나중에 승인 후 설정)
+    saved = await save_chat_scope(
+        chat_id=chat_id,
+        chat_title=chat_title,
+        church=church,
+        dept=dept,
+        region_name=None,
+        zone_name=None,
+        owner_user_id=user.id if user else None,
+        owner_name=owner_name,
+    )
+    
+    if not saved:
+        await q.edit_message_text(
+            "❌ scope 저장 실패. 다시 시도해주세요.",
+            reply_markup=kb_pre_approval_church(),
+        )
+        return
+    
+    msg = (
+        "🔒 <b>승인되지 않은 방입니다</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📋 <b>이 방 정보</b>:\n"
+        f"• Chat ID: <code>{chat_id}</code>\n"
+        f"• 방 이름: {chat_title}\n\n"
+        f"✅ <b>1단계: 소속 교회</b> → {church}\n"
+        f"✅ <b>2단계: 소속 부서</b> → {dept}\n\n"
+        f"👇 <b>3단계: 아래 [🙏 승인 신청하기] 버튼을 누르면</b>\n"
+        f"   <i>{church} {dept} 관리자</i> 에게 자동 알림이 전달됩니다."
+    )
+    
+    try:
+        await q.edit_message_text(
+            msg,
+            parse_mode="HTML",
+            reply_markup=kb_final_approval(church, dept),
+        )
+    except Exception as e:
+        logger.warning("prereq_dept_callback edit 실패: %s", e)
+
+
+async def prereq_back_church_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🆕 v5.8: 부서 선택 단계에서 ⬅️ 누르면 교회 선택으로 복귀"""
+    q = update.callback_query
+    await q.answer()
+    
+    chat_id = update.effective_chat.id
+    chat_title = update.effective_chat.title or update.effective_chat.full_name or ""
+    
+    try:
+        await q.edit_message_text(
+            unauthorized_message(chat_id, chat_title),
+            parse_mode="HTML",
+            reply_markup=kb_pre_approval_church(),
+        )
+    except Exception as e:
+        logger.warning("prereq_back_church 실패: %s", e)
+
+
+async def prereq_back_dept_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🆕 v5.8: 최종 단계에서 ⬅️ 누르면 부서 선택으로 복귀"""
+    q = update.callback_query
+    await q.answer()
+    
+    data = q.data  # "prereq_back_dept:서울교회"
+    church = data.split(":", 1)[1] if ":" in data else ""
+    if not church:
+        # 교회 정보 없으면 처음부터
+        await prereq_back_church_callback(update, context)
+        return
+    
+    chat_id = update.effective_chat.id
+    chat_title = update.effective_chat.title or update.effective_chat.full_name or ""
+    
+    msg = (
+        "🔒 <b>승인되지 않은 방입니다</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📋 <b>이 방 정보</b>:\n"
+        f"• Chat ID: <code>{chat_id}</code>\n"
+        f"• 방 이름: {chat_title}\n\n"
+        f"✅ <b>1단계: 소속 교회</b> → {church}\n\n"
+        f"👇 <b>2단계: 소속 부서를 선택해주세요</b>"
+    )
+    
+    try:
+        await q.edit_message_text(
+            msg,
+            parse_mode="HTML",
+            reply_markup=kb_pre_approval_dept(church),
+        )
+    except Exception as e:
+        logger.warning("prereq_back_dept 실패: %s", e)
+
+
 async def request_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """승인 신청 버튼 눌림 → 관리자들에게 DM 알림."""
     import html as _html
@@ -3878,6 +4114,207 @@ def main():
             return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
+    # ─────────────────────────────────────────────────────────────
+    # 🆕 v5.7: 관리자 메시지 발송 endpoint
+    # ─────────────────────────────────────────────────────────────
+    BROADCAST_TOKEN = os.environ.get("BROADCAST_TOKEN", os.environ.get("SCHEDULER_TOKEN", ""))
+
+    async def _resolve_target_chats(scope: dict) -> list:
+        """scope 에 따라 발송 대상 활성 그룹방 목록 반환"""
+        scope_type = (scope or {}).get("type") or "all"
+        scope_church = (scope or {}).get("church")
+        scope_dept = (scope or {}).get("dept")
+
+        qs = "telegram_chat_scope?select=chat_id,chat_title,church,dept,region_name,zone_name&limit=5000"
+        if scope_type == "church" and scope_church:
+            qs += f"&church=eq.{quote(scope_church)}"
+        elif scope_type == "dept" and scope_church and scope_dept:
+            qs += f"&church=eq.{quote(scope_church)}&dept=eq.{quote(scope_dept)}"
+
+        scope_rows = await sb_get(qs) or []
+        chat_ids = [r["chat_id"] for r in scope_rows if r.get("chat_id")]
+        if not chat_ids:
+            return []
+
+        chat_ids_str = ",".join(str(c) for c in chat_ids)
+        auth_rows = await sb_get(
+            f"bot_authorized_chats?select=chat_id&chat_id=in.({chat_ids_str})&is_active=eq.true&limit=5000"
+        ) or []
+        authorized = {r["chat_id"] for r in auth_rows}
+        return [r for r in scope_rows if r["chat_id"] in authorized]
+
+    def _check_requester_scope(scope: dict, requester: dict) -> tuple:
+        """권한 검증. (scope_적용, error_메시지) 튜플 반환"""
+        req_role = (requester or {}).get("role") or "zipa"
+        req_church = (requester or {}).get("church")
+        req_dept = (requester or {}).get("dept")
+        scope_type = (scope or {}).get("type") or "all"
+        scope_church = (scope or {}).get("church")
+        scope_dept = (scope or {}).get("dept")
+
+        if req_role == "zipa":
+            return scope, None  # 모두 허용
+        if req_role == "church":
+            # 자기 교회만
+            if scope_type == "all":
+                return ({"type": "church", "church": req_church}, None)
+            if scope_church != req_church:
+                return None, "교회관리자는 자기 교회만 발송 가능"
+            return scope, None
+        if req_role == "dept":
+            # 자기 교회 + 자기 부서만
+            if scope_type != "dept" or scope_church != req_church or scope_dept != req_dept:
+                return None, "부서관리자는 자기 부서만 발송 가능"
+            return scope, None
+        return None, "알 수 없는 권한"
+
+    async def broadcast_preview_handler(request):
+        """발송 전 대상 미리보기"""
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+        token = data.get("token") or request.headers.get("X-Broadcast-Token", "")
+        if not BROADCAST_TOKEN or token != BROADCAST_TOKEN:
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+        scope, err = _check_requester_scope(data.get("scope") or {}, data.get("requester") or {})
+        if err:
+            return web.json_response({"ok": False, "error": err}, status=403)
+
+        try:
+            chats = await _resolve_target_chats(scope)
+            return web.json_response({
+                "ok": True,
+                "total": len(chats),
+                "chats": [
+                    {
+                        "chat_id": c["chat_id"],
+                        "title": c.get("chat_title", "(제목없음)"),
+                        "church": c.get("church"),
+                        "dept": c.get("dept"),
+                    }
+                    for c in chats
+                ],
+                "applied_scope": scope,
+            })
+        except Exception as e:
+            logger.exception("broadcast_preview 실패: %s", e)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def broadcast_send_handler(request):
+        """관리자 페이지에서 호출 → 그룹방들에 메시지 발송"""
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+        token = data.get("token") or request.headers.get("X-Broadcast-Token", "")
+        if not BROADCAST_TOKEN or token != BROADCAST_TOKEN:
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+        message = (data.get("message") or "").strip()
+        if not message:
+            return web.json_response({"ok": False, "error": "empty_message"}, status=400)
+        if len(message) > 4000:
+            return web.json_response({"ok": False, "error": "message_too_long"}, status=400)
+
+        scope, err = _check_requester_scope(data.get("scope") or {}, data.get("requester") or {})
+        if err:
+            return web.json_response({"ok": False, "error": err}, status=403)
+
+        # 🆕 v5.7: 버튼 (URL 바로가기) 처리
+        # buttons: [[{"text":"라벨", "url":"https://..."}, ...], ...]
+        buttons = data.get("buttons") or []
+        reply_markup = None
+        if buttons and isinstance(buttons, list):
+            try:
+                from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                btn_rows = []
+                for row in buttons[:5]:  # 최대 5줄
+                    if not isinstance(row, list):
+                        continue
+                    btn_row = []
+                    for b in row[:3]:  # 줄당 최대 3개
+                        if not isinstance(b, dict):
+                            continue
+                        text = (b.get("text") or "").strip()[:64]
+                        url = (b.get("url") or "").strip()
+                        if not text or not url:
+                            continue
+                        if not (url.startswith("http://") or url.startswith("https://") or url.startswith("tg://")):
+                            continue
+                        btn_row.append(InlineKeyboardButton(text=text, url=url))
+                    if btn_row:
+                        btn_rows.append(btn_row)
+                if btn_rows:
+                    reply_markup = InlineKeyboardMarkup(btn_rows)
+            except Exception as e:
+                logger.warning("버튼 파싱 실패: %s", e)
+
+        try:
+            target_chats = await _resolve_target_chats(scope)
+        except Exception as e:
+            logger.exception("broadcast 대상 조회 실패: %s", e)
+            return web.json_response({"ok": False, "error": f"db_error: {e}"}, status=500)
+
+        if not target_chats:
+            return web.json_response({
+                "ok": True,
+                "total_targets": 0,
+                "sent": 0,
+                "failed": 0,
+                "failures": [],
+                "message": "발송 대상 그룹방이 없습니다",
+            })
+
+        # 🆕 v5.7: 안전한 HTML 서식 허용 (Telegram 지원 태그만)
+        # 허용 태그: <b>, <strong>, <i>, <em>, <u>, <s>, <strike>, <code>, <pre>, <a>, <br>
+        # 다른 태그는 그대로 출력 (Telegram이 무시) — 위험한 것 없음
+        # XSS 위험: 봇은 텍스트만 보내고 HTML 렌더는 Telegram 클라이언트에서만 발생 → 안전
+        prefixed_message = (
+            "📢 <b>지파 관리자 안내</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{message}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>본 메시지는 관리자 페이지에서 발송됨</i>"
+        )
+
+        sent = 0
+        failed = 0
+        failures = []
+        for r in target_chats:
+            cid = r["chat_id"]
+            try:
+                send_kwargs = {
+                    "chat_id": cid,
+                    "text": prefixed_message,
+                    "parse_mode": "HTML",
+                }
+                if reply_markup is not None:
+                    send_kwargs["reply_markup"] = reply_markup
+                await app.bot.send_message(**send_kwargs)
+                sent += 1
+                await asyncio.sleep(0.05)  # rate limit 안전장치
+            except Exception as e:
+                failed += 1
+                failures.append({
+                    "chat_id": cid,
+                    "title": r.get("chat_title"),
+                    "error": str(e)[:200],
+                })
+                logger.warning("broadcast 발송 실패 chat=%s err=%s", cid, e)
+
+        return web.json_response({
+            "ok": True,
+            "total_targets": len(target_chats),
+            "sent": sent,
+            "failed": failed,
+            "failures": failures[:20],
+        })
+
+
     async def miniapp_html_handler(request):
         """미니웹앱 HTML 정적 서빙"""
         try:
@@ -4129,6 +4566,9 @@ def main():
     http_app.router.add_get("/trigger/special-reminder",   trigger_special_reminder)
     http_app.router.add_post("/trigger/weekly-rollover",   trigger_weekly_rollover)
     http_app.router.add_get("/trigger/weekly-rollover",    trigger_weekly_rollover)
+    # 🆕 v5.7: 관리자 메시지 발송
+    http_app.router.add_post("/broadcast/preview", broadcast_preview_handler)
+    http_app.router.add_post("/broadcast/send",    broadcast_send_handler)
 
     async def _run():
         await app.initialize()
