@@ -72,7 +72,7 @@ STEP_CHOICES = {
 }
 
 # ── 특별관리 4항목 ─────────────────────────────────────────────────────────────
-# 1번: 최초 1회만 · 2/3/4번: 매주 수요일 07시 초기화
+# 1번: 최초 1회만 · 2/3/4번: 매주 수요일 08시 초기화
 SP_ITEM_LABELS = {
     "item1_chat_invited":  "대책방 초대완료 (구역장·인섬교·강사·전도사·심방부사명자)",
     "item2_feedback_done": "금주 피드백 진행",
@@ -152,6 +152,52 @@ async def sb_rpc(func: str, payload: dict):
             logger.error("RPC %s failed %d: %s", func, r.status_code, r.text[:300])
         r.raise_for_status()
         if not r.content:
+            return None
+        try:
+            return r.json()
+        except Exception:
+            return None
+
+
+async def sb_post(path: str, payload, extra_headers: dict = None):
+    """POST /rest/v1/{path}. payload 는 dict 또는 list. PostgREST upsert 용."""
+    headers = dict(HEADERS)
+    if extra_headers:
+        headers.update(extra_headers)
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/{path}",
+            headers=headers,
+            content=json.dumps(payload),
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            logger.error("sb_post %s failed %d: %s", path, r.status_code, r.text[:300])
+        r.raise_for_status()
+        if not r.content or not r.content.strip():
+            return None
+        try:
+            return r.json()
+        except Exception:
+            return None
+
+
+async def sb_patch(path: str, payload: dict, extra_headers: dict = None):
+    """PATCH /rest/v1/{path} — 기존 row 수정."""
+    headers = dict(HEADERS)
+    if extra_headers:
+        headers.update(extra_headers)
+    async with httpx.AsyncClient() as client:
+        r = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/{path}",
+            headers=headers,
+            content=json.dumps(payload),
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            logger.error("sb_patch %s failed %d: %s", path, r.status_code, r.text[:300])
+        r.raise_for_status()
+        if not r.content or not r.content.strip():
             return None
         try:
             return r.json()
@@ -579,10 +625,14 @@ def kb_reply_main(is_private: bool = True) -> ReplyKeyboardMarkup:
     """하단에 고정되는 리플라이 키보드. 키보드 아이콘(⌨️) 탭하면 이 버튼들이 나옴.
     
     ⚠️ 웹앱 버튼은 1:1 개인 채팅에서만 작동. 그룹에서는 제외.
+    🆕 1:1 개인방에선 '특별관리결석자' 버튼 숨김 (그룹방 전용 기능)
     """
-    rows = [
-        [KeyboardButton("📋 결석자 심방"), KeyboardButton("🚨 특별관리결석자")],
-    ]
+    if is_private:
+        # 🆕 개인방: 결석자 심방만
+        rows = [[KeyboardButton("📋 결석자 심방")]]
+    else:
+        # 그룹방: 결석자 심방 + 특별관리결석자
+        rows = [[KeyboardButton("📋 결석자 심방"), KeyboardButton("🚨 특별관리결석자")]]
     # 웹앱 버튼은 개인 채팅에서만 추가 (그룹에서는 "Web app buttons can be used in private chats only" 에러 발생)
     if is_private and MINIAPP_URL.startswith("https://"):
         rows.append([KeyboardButton(
@@ -599,11 +649,15 @@ def kb_reply_main(is_private: bool = True) -> ReplyKeyboardMarkup:
 
 
 def kb_main_menu(is_private: bool = True) -> InlineKeyboardMarkup:
-    """인라인 메인 메뉴. 웹앱 버튼은 개인 채팅에서만."""
+    """인라인 메인 메뉴. 웹앱 버튼은 개인 채팅에서만.
+    🆕 1:1 개인방에선 '특별관리결석자' 메뉴 숨김 (그룹방 전용 기능)
+    """
     rows = [
         [InlineKeyboardButton("📋 결석자 심방",       callback_data="m:absentee")],
-        [InlineKeyboardButton("🚨 특별관리결석자",    callback_data="m:special")],
     ]
+    # 🆕 특별관리는 그룹방에서만 노출
+    if not is_private:
+        rows.append([InlineKeyboardButton("🚨 특별관리결석자",    callback_data="m:special")])
     # 웹앱 버튼은 개인 채팅에서만
     if is_private and MINIAPP_URL.startswith("https://"):
         rows.append([InlineKeyboardButton(
@@ -703,7 +757,7 @@ HELP_TEXT = (
     "   ② 금주 피드백 진행 (주간 리셋)\n"
     "   ③ 금주 심방예정일\n"
     "   ④ 금주 심방계획\n"
-    "매주 수요일 07:00 KST 미체크 항목 리마인더 자동 발송\n"
+    "매주 수요일 08:00 KST 미체크 항목 리마인더 자동 발송\n"
     "💡 ③④ 입력 시 결석자 심방 기록과 자동 동기화\n\n"
 
     "<b>📱 4️⃣ 미니앱 (개인 채팅에서만)</b>\n"
@@ -718,8 +772,8 @@ HELP_TEXT = (
 
     "<b>📅 5️⃣ 자동 알림 스케줄 (Cloud Scheduler)</b>\n"
     "• <b>매주 수요일 00:00 KST</b> → 새 주차 자동 전환\n"
-    "• <b>매주 수요일 07:00 KST</b> → 모든 방에 이번 주 결석자 심방계획 요청\n"
-    "• <b>매주 수요일 07:00 KST</b> → 특별관리 대상 미체크 항목 리마인더\n\n"
+    "• <b>매주 수요일 08:00 KST</b> → 모든 방에 이번 주 결석자 심방계획 요청\n"
+    "• <b>매주 수요일 08:00 KST</b> → 특별관리 대상 미체크 항목 리마인더\n\n"
 
     "<b>👥 6️⃣ 관리자 권한 3단계</b>\n"
     "• 🛡 <b>지파관리자</b> (1명) — 모든 방 승인/관리\n"
@@ -736,7 +790,17 @@ HELP_TEXT = (
     "• <code>/help</code> — 이 사용법\n"
     "• <code>/diagnose</code> — DB 진단\n"
     "• <code>/approve &lt;chat_id&gt;</code> — 방 승인 (관리자 전용)\n"
-    "• <code>/deny &lt;chat_id&gt;</code> — 방 거부 (관리자 전용)\n\n"
+    "• <code>/deny &lt;chat_id&gt;</code> — 방 거부 (관리자 전용)\n"
+    "• <code>/allowed</code> — (특별관리 대책방) 봇 사용자 목록\n"
+    "• <code>/allow</code> — (특별관리 대책방) 봇 사용자 추가 (reply 필요)\n"
+    "• <code>/disallow</code> — (특별관리 대책방) 봇 사용자 제거 (reply 필요)\n\n"
+
+    "<b>🛡 8️⃣ 특별관리 대책방 사용자 제한</b>\n"
+    "특별관리 대책방은 <b>지정된 분만</b> 봇 사용 가능:\n"
+    "• 첫 봇 사용자 → 자동으로 <b>owner(👑)</b> 등록\n"
+    "• owner 가 다른 분을 추가하려면:\n"
+    "  추가할 분의 메시지에 <b>답장(reply)</b> + <code>/allow</code>\n"
+    "• 등록 안 된 분이 명령 보내면 1회 안내 후 무시\n\n"
 
     "━━━━━━━━━━━━━━━━━━━━\n"
     "🌐 <b>상세 분석·통계·CSV 는 웹 대시보드에서</b>\n"
@@ -823,6 +887,207 @@ async def record_chat_access(chat_id: int):
         await sb_rpc("record_chat_access", {"p_chat_id": chat_id})
     except Exception as e:
         logger.warning("record_chat_access 실패: %s", e)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 🆕 특별관리 대책방 화이트리스트 (chat_allowed_users)
+#   - 특별관리 대책방(special_management_targets.monitor_chat_id 가 있는 방)은
+#     명시적으로 등록된 user_id 만 봇 사용 가능.
+#   - 첫 봇 사용자가 자동으로 owner 로 등록됨 (그 후엔 owner 가 추가)
+#   - 일반 그룹방·개인방은 영향 없음.
+# ═════════════════════════════════════════════════════════════════════════════
+async def is_special_monitor_chat(chat_id: int) -> bool:
+    """이 방이 특별관리 대책방(monitor_chat_id) 인지 확인."""
+    if not chat_id:
+        return False
+    try:
+        rows = await sb_get(
+            f"special_management_targets?select=monitor_chat_id&monitor_chat_id=eq.{chat_id}&limit=1"
+        )
+        return bool(rows)
+    except Exception as e:
+        logger.warning("is_special_monitor_chat 실패: %s", e)
+        return False
+
+
+async def list_chat_allowed_users(chat_id: int) -> list[dict]:
+    """이 방의 화이트리스트 유저 목록 (활성 only)."""
+    try:
+        rows = await sb_get(
+            f"chat_allowed_users?select=chat_id,user_id,user_name,is_owner,added_by,added_at"
+            f"&chat_id=eq.{chat_id}&is_active=eq.true&limit=100"
+        ) or []
+        return rows
+    except Exception as e:
+        logger.warning("list_chat_allowed_users 실패: %s", e)
+        return []
+
+
+async def is_user_allowed_in_chat(chat_id: int, user_id: int) -> bool:
+    """이 유저가 이 방에서 봇을 쓸 수 있는지 (화이트리스트 체크)."""
+    if not chat_id or not user_id:
+        return False
+    try:
+        rows = await sb_get(
+            f"chat_allowed_users?select=user_id"
+            f"&chat_id=eq.{chat_id}&user_id=eq.{user_id}&is_active=eq.true&limit=1"
+        )
+        return bool(rows)
+    except Exception as e:
+        logger.warning("is_user_allowed_in_chat 실패: %s", e)
+        return False
+
+
+async def add_chat_allowed_user(
+    chat_id: int, user_id: int, user_name: str = "",
+    is_owner: bool = False, added_by: int = None
+) -> bool:
+    """화이트리스트에 유저 추가. 이미 존재하면 is_active=true 로 업데이트."""
+    if not chat_id or not user_id:
+        return False
+    try:
+        # upsert (chat_id, user_id 유니크 가정)
+        await sb_rpc("upsert_chat_allowed_user", {
+            "p_chat_id": chat_id,
+            "p_user_id": user_id,
+            "p_user_name": user_name or "",
+            "p_is_owner": is_owner,
+            "p_added_by": added_by,
+        })
+        return True
+    except Exception as e:
+        # RPC 미존재 시 fallback: 직접 upsert
+        logger.warning("upsert_chat_allowed_user RPC 실패: %s — fallback 시도", e)
+        try:
+            from urllib.parse import quote as _q
+            payload = {
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "user_name": user_name or "",
+                "is_owner": bool(is_owner),
+                "added_by": added_by,
+                "is_active": True,
+            }
+            await sb_post(
+                "chat_allowed_users?on_conflict=chat_id,user_id",
+                payload,
+                extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+            )
+            return True
+        except Exception as e2:
+            logger.warning("chat_allowed_users 직접 upsert 실패: %s", e2)
+            return False
+
+
+async def remove_chat_allowed_user(chat_id: int, user_id: int) -> bool:
+    """화이트리스트에서 제거 (soft delete: is_active=false)."""
+    if not chat_id or not user_id:
+        return False
+    try:
+        from urllib.parse import quote as _q
+        await sb_patch(
+            f"chat_allowed_users?chat_id=eq.{chat_id}&user_id=eq.{user_id}",
+            {"is_active": False},
+        )
+        return True
+    except Exception as e:
+        logger.warning("remove_chat_allowed_user 실패: %s", e)
+        return False
+
+
+# 🆕 한 번 안내 메시지를 보낸 (chat_id, user_id) 쌍은 메모리에 저장 — 같은 사람에게 반복 안내 방지
+_unallowed_notified: set[tuple[int, int]] = set()
+
+
+async def ensure_user_allowed_in_special_chat(update: Update) -> tuple[bool, bool]:
+    """🆕 특별관리 대책방에서 유저 권한 체크.
+    
+    Returns: (허용여부, 안내_메시지_보냈는지)
+    
+    동작:
+    - 이 방이 특별관리 대책방이 아니면 → (True, False)  (영향 없음)
+    - 화이트리스트가 비어있고 (첫 사용자):
+        → 이 user를 owner로 자동 등록하고 (True, False) 반환
+    - 화이트리스트에 등록된 user_id 면 → (True, False)
+    - 등록 안된 user_id 면 → 1회 안내 후 (False, True)
+    """
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return True, False  # 정보 없으면 차단하지 않음 (안전 fallback)
+
+    chat_id = chat.id
+    user_id = user.id
+
+    # 봇 관리자는 무조건 통과
+    if await is_bot_admin_user(user_id):
+        return True, False
+
+    # 특별관리 대책방이 아니면 영향 없음
+    is_sp_chat = await is_special_monitor_chat(chat_id)
+    if not is_sp_chat:
+        return True, False
+
+    # 현재 화이트리스트 조회
+    allowed = await list_chat_allowed_users(chat_id)
+
+    if not allowed:
+        # 🆕 첫 봇 사용자 → 자동으로 owner 등록
+        user_display = user.full_name or user.username or f"user_{user_id}"
+        ok = await add_chat_allowed_user(
+            chat_id=chat_id,
+            user_id=user_id,
+            user_name=user_display,
+            is_owner=True,
+            added_by=user_id,
+        )
+        if ok:
+            logger.info(
+                "🆕 chat_allowed_users 자동 등록 (owner): chat_id=%s user_id=%s name=%s",
+                chat_id, user_id, user_display,
+            )
+            # 첫 사용자에게 짧게 안내
+            try:
+                await update.effective_message.reply_text(
+                    "🛡 <b>특별관리 대책방 — 사용자 등록 완료</b>\n\n"
+                    f"이 방의 봇은 <b>{_html_escape(user_display)}</b> 님(첫 사용자)이\n"
+                    f"<b>관리자(owner)</b> 로 자동 등록되었습니다.\n\n"
+                    "다른 분이 이 방의 봇을 사용하려면 owner 가\n"
+                    "<code>/allow</code> 명령으로 추가해야 합니다.\n"
+                    "(다른 사용자가 봇 명령을 보내면 무시됩니다)\n\n"
+                    "<i>💡 owner 변경은 관리자 페이지에서 가능합니다.</i>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        return True, False
+
+    # 화이트리스트가 있는데 이 user 가 등록되어 있나?
+    is_allowed = any(int(r.get("user_id", 0)) == int(user_id) for r in allowed)
+    if is_allowed:
+        return True, False
+
+    # 등록 안됨 → 1회만 안내
+    key = (chat_id, user_id)
+    if key not in _unallowed_notified:
+        _unallowed_notified.add(key)
+        try:
+            await update.effective_message.reply_text(
+                "🛡 이 방의 봇은 <b>지정된 분만 사용 가능합니다</b>.\n"
+                "(다음 명령부터는 응답하지 않습니다)",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return False, True
+
+    # 이미 안내 보낸 사람 → 조용히 무시
+    return False, False
+
+
+def _html_escape(s: str) -> str:
+    import html as _h
+    return _h.escape(str(s or ""))
 
 
 def unauthorized_message(chat_id: int, chat_title: str = "") -> str:
@@ -1006,6 +1271,10 @@ async def ensure_authorized(update: Update) -> bool:
         # 그룹방
         if await is_chat_authorized(chat_id):
             await record_chat_access(chat_id)
+            # 🆕 특별관리 대책방이면 화이트리스트도 체크
+            allowed, _ = await ensure_user_allowed_in_special_chat(update)
+            if not allowed:
+                return False
             return True
 
     # 미승인 또는 차단 — 차단인지 미승인인지 구분해서 다른 메시지
@@ -1639,6 +1908,16 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await clear_tmp(chat_id)
             await _show_church_select(update, "abs")
         elif data == "m:special":
+            # 🆕 1:1 개인방에선 특별관리 메뉴 차단 (그룹방 전용 기능)
+            if is_private_chat(update):
+                await q.message.reply_text(
+                    "ℹ️ <b>특별관리결석자</b> 메뉴는 그룹방 전용입니다.\n\n"
+                    "특별관리 대상자의 <b>대책방(그룹방)</b> 에서만\n"
+                    "사용할 수 있습니다. 1:1 개인방에서는 사용할 수 없습니다.\n\n"
+                    "💡 결석자 심방 정보는 <code>📋 결석자 심방</code> 메뉴를 이용해주세요.",
+                    parse_mode="HTML",
+                )
+                return
             # 🔧 특별관리 진입 시 이전 결석자 심방 컨텍스트 완전 제거
             await clear_tmp(chat_id)
             # 🆕 v4.7: 이미 등록된 사람 있으면 그 사람 정보로 바로 이동
@@ -2062,6 +2341,15 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _show_church_menu(update, "abs")
             return
         if text == "🚨 특별관리결석자":
+            # 🆕 1:1 개인방에선 특별관리 메뉴 차단 (그룹방 전용 기능)
+            if is_private_chat(update):
+                await update.message.reply_text(
+                    "ℹ️ <b>특별관리결석자</b> 메뉴는 그룹방 전용입니다.\n\n"
+                    "특별관리 대상자의 <b>대책방(그룹방)</b> 에서만\n"
+                    "사용할 수 있습니다.",
+                    parse_mode="HTML",
+                )
+                return
             # 🔧 이전 결석자 심방 컨텍스트 제거
             await clear_tmp(chat_id)
             # 🆕 v4.7: 이미 이 방에 등록된 특별관리 대상이 있으면 그 사람 정보로 바로 이동
@@ -2997,7 +3285,7 @@ async def _on_sp_pick(update: Update, chat_id: int, church: str, dept: str, name
         await q.edit_message_text(
             f"✅ <b>{_html.escape(str(name))}</b> 님을 <b>특별관리 대상</b>으로 등록했습니다.\n"
             f"이 방은 이제 <b>{_html.escape(str(name))}</b>님 전용 피드백방입니다.\n\n"
-            f"매주 수요일 07:00 KST 에 "
+            f"매주 수요일 08:00 KST 에 "
             f"미체크 항목 리마인더가 이 방으로 발송됩니다.",
             parse_mode="HTML",
         )
@@ -3006,7 +3294,7 @@ async def _on_sp_pick(update: Update, chat_id: int, church: str, dept: str, name
         await q.message.reply_text(
             f"✅ {name} 님을 특별관리 대상으로 등록했습니다.\n"
             f"이 방은 {name}님 전용 피드백방입니다.\n"
-            f"매주 수요일 07:00 KST 에 리마인더가 발송됩니다."
+            f"매주 수요일 08:00 KST 에 리마인더가 발송됩니다."
         )
 
     await save_ctx(
@@ -3058,7 +3346,7 @@ async def _show_sp_detail(update, chat_id: int, church: str, dept: str, name: st
         f"   (구역장·인섬교·강사·전도사·심방부사명자)\n"
         f"   <i>최초 1회만 체크 (주간 리셋 안 됨)</i>\n\n"
         f"{'✅' if item2 else '⬜️'} <b>2. 금주 피드백 진행</b>\n"
-        f"   <i>매주 수요일 07시 초기화</i>\n\n"
+        f"   <i>매주 수요일 08시 초기화</i>\n\n"
         f"📅 <b>3. 금주 심방예정일:</b> {_html.escape(str(item3)) if item3 else '<i>미입력</i>'}\n\n"
         f"📝 <b>4. 금주 심방계획:</b> {_html.escape(str(item4)) if item4 else '<i>미입력</i>'}"
     )
@@ -3240,7 +3528,7 @@ async def _on_sp_unregister_ctx(update: Update, chat_id: int):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 매주 수요일 07시 KST — 주간 리마인더 + 2/3/4번 리셋
+# 매주 수요일 08시 KST — 주간 리마인더 + 2/3/4번 리셋
 # ═════════════════════════════════════════════════════════════════════════════
 async def weekly_reminder_job(context: ContextTypes.DEFAULT_TYPE, source: str = "job_queue"):
     """🛡 v4.7: 중복 실행 방지."""
@@ -3277,18 +3565,18 @@ async def weekly_reminder_job(context: ContextTypes.DEFAULT_TYPE, source: str = 
                 unchecked.append("⬜️ 4. 금주 심방계획 (미입력)")
 
             if unchecked:
+                # 🆕 메시지 간소화 — 이름·부서·지역만
                 msg = (
-                    f"🔔 *주간 리마인더* (수요일 07시)\n"
-                    f"👤 *{md(name)}* ({md(dept)} / {md(region)} {md(zone)})\n\n"
-                    f"미체크 항목:\n" + "\n".join(unchecked) +
-                    f"\n\n/menu → 🚨 특별관리결석자 에서 업데이트하세요."
+                    f"📋 *체크리스트 — 미진행 항목*\n"
+                    f"👤 *{md(name)}* ({md(dept)})\n\n"
+                    + "\n".join(unchecked) +
+                    f"\n\n_/menu → 🚨 특별관리결석자 에서 입력_"
                 )
             else:
                 msg = (
-                    f"🔔 *주간 리마인더*\n"
-                    f"👤 {md(name)} ({md(dept)} / {md(region)} {md(zone)})\n\n"
-                    f"✅ 모든 항목 체크 완료. 수고하셨습니다!\n"
-                    f"_(2~4번은 곧 초기화됩니다)_"
+                    f"✅ *모든 항목 완료*\n"
+                    f"👤 {md(name)} ({md(dept)})\n\n"
+                    f"수고하셨습니다! _(2~4번은 곧 초기화됩니다)_"
                 )
 
             try:
@@ -3317,11 +3605,11 @@ async def force_weekly_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 🆕 매주 수요일 07시 KST — 모든 봇 방에 타겟 결석자 심방계획 요청
+# 🆕 매주 수요일 08시 KST — 모든 봇 방에 타겟 결석자 심방계획 요청
 # ═════════════════════════════════════════════════════════════════════════════
 async def wednesday_visit_plan_request_job(context: ContextTypes.DEFAULT_TYPE, source: str = "job_queue"):
     """
-    매주 수요일 07시 KST에 실행.
+    매주 수요일 08시 KST에 실행.
     봇이 등록된 모든 방(telegram_chat_scope) 에 현재 주차 결석자 요약 + 심방계획 요청.
     
     🛡 v4.7: 같은 날 중복 실행 방지 (Cloud Scheduler + JobQueue 동시 실행 안전).
@@ -3375,83 +3663,51 @@ async def wednesday_visit_plan_request_job(context: ContextTypes.DEFAULT_TYPE, s
             if not church:
                 continue  # 교회 없는 방은 스킵
 
-            # 3) 이 방의 범위에 맞는 결석자 조회
+            # 🆕 메시지 간소화: 결석자 현황·목록 조회 제거
+            #     이 방이 특별관리 대책방인지에 따라 메시지 분기
             try:
-                path = (
-                    f"weekly_visit_targets"
-                    f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
-                    f"&week_key=eq.{quote(week_key)}"
-                    f"&church=eq.{quote(church)}"
-                )
-                if dept:   path += f"&dept=eq.{quote(dept)}"
-                if region: path += f"&region_name=eq.{quote(region)}"
-                if zone:   path += f"&zone_name=eq.{quote(normalize_zone(zone))}"
-                path += "&order=consecutive_absent_count.desc,name.asc&limit=500"
-
-                rows = await sb_get(path) or []
-                rows = await enrich_names(rows)
-
-                # 이 방 범위의 결석자 중 타겟만 뽑기 (weekly_visit_progress.is_target=true)
-                # 진행도 확인 (타겟 지정 여부, 심방계획 입력 여부)
-                target_summary = {"total": 0, "with_plan": 0, "target_set": 0}
-                if rows:
-                    row_ids = [r.get("row_id") for r in rows if r.get("row_id")]
-                    try:
-                        in_list = ",".join([quote(x) for x in row_ids])
-                        prog_rows = await sb_get(
-                            f"weekly_visit_progress?select=row_id,is_target,plan_text"
-                            f"&week_key=eq.{quote(week_key)}&row_id=in.({in_list})&limit=500"
-                        ) or []
-                        prog_map = {p["row_id"]: p for p in prog_rows}
-                        target_summary["total"] = len(rows)
-                        for r in rows:
-                            p = prog_map.get(r.get("row_id"))
-                            if p:
-                                if p.get("is_target"): target_summary["target_set"] += 1
-                                if p.get("plan_text", ""): target_summary["with_plan"] += 1
-                    except Exception as pe:
-                        logger.warning("progress 조회 실패 (chat_id=%s): %s", chat_id, pe)
-
-                # 4) 메시지 구성 (HTML parse_mode - Markdown 특수문자 파싱 에러 방지)
                 import html as _html
                 scope_txt = " / ".join([x for x in [church, dept, region, zone] if x])
                 week_label_safe = _html.escape(week_label or week_key)
 
-                if not rows:
+                # 🆕 특별관리 대책방 여부 + 대상자 정보
+                sp_target = None
+                try:
+                    sp_rows = await sb_get(
+                        f"special_management_targets?select=name,dept,phone_last4,monitor_chat_id"
+                        f"&monitor_chat_id=eq.{chat_id}&limit=1"
+                    ) or []
+                    if sp_rows:
+                        sp_target = sp_rows[0]
+                except Exception as e:
+                    logger.warning("특별관리 조회 실패 chat=%s: %s", chat_id, e)
+
+                if sp_target:
+                    # 🚨 특별관리 대책방 — 피드백/심방날짜/심방계획 안내
+                    sp_name = _html.escape(sp_target.get("name", "?"))
                     msg = (
-                        f"📋 <b>수요일 심방계획 요청</b>\n"
+                        f"🚨 <b>수요일 알림 — 특별관리 대책방</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"📌 담당: <b>{_html.escape(scope_txt)}</b>\n"
+                        f"📌 대상자: <b>{sp_name}</b>\n"
                         f"📅 주차: <b>{week_label_safe}</b>\n\n"
-                        f"✅ 이번 주 해당 범위 결석자 없습니다. 수고하셨습니다!"
+                        f"<b>🙏 이번 주 다음 항목을 진행해주세요:</b>\n"
+                        f"1️⃣ <b>금주의 피드백</b> 진행\n"
+                        f"2️⃣ <b>심방예정일</b> 정하기\n"
+                        f"3️⃣ <b>심방계획</b> 세우기\n\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"하단 <code>🚨 특별관리결석자</code> 버튼으로 입력하세요."
                     )
                 else:
-                    # 샘플 이름 몇 개 보여주기
-                    sample_names = []
-                    for r in rows[:10]:
-                        nm = r.get("name", "?")
-                        streak = r.get("consecutive_absent_count", 0) or 0
-                        zn = r.get("zone_name", "") or ""
-                        sample_names.append(
-                            f"• {_html.escape(nm)} {_html.escape(zn)} · 연속{streak}회"
-                        )
-                    more_line = f"\n... 외 {len(rows) - 10}명" if len(rows) > 10 else ""
-
+                    # 📋 일반 그룹방 / 개인방 — 간단 안내
                     msg = (
                         f"📋 <b>수요일 심방계획 요청</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n\n"
                         f"📌 담당: <b>{_html.escape(scope_txt)}</b>\n"
                         f"📅 주차: <b>{week_label_safe}</b>\n\n"
-                        f"📊 <b>이번 주 결석자 현황</b>\n"
-                        f"   • 총 <b>{target_summary['total']}</b>명\n"
-                        f"   • 🎯 타겟 지정: <b>{target_summary['target_set']}</b>명\n"
-                        f"   • 📝 심방계획 입력: <b>{target_summary['with_plan']}</b>명\n\n"
                         f"<b>🙏 주일까지 다음 작업을 부탁드립니다:</b>\n"
                         f"1️⃣ 결석자 중 <b>타겟 대상 선정</b>\n"
                         f"2️⃣ 각 타겟에 대한 <b>심방계획 작성</b>\n"
-                        f"3️⃣ <b>심방 실행 & 기록 업데이트</b>\n\n"
-                        f"<i>결석자 목록 (상위 10명)</i>\n"
-                        f"{chr(10).join(sample_names)}{more_line}\n\n"
+                        f"3️⃣ <b>심방 실행 &amp; 기록 업데이트</b>\n\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"하단 <code>📋 결석자 심방</code> 버튼으로 시작하세요."
                     )
@@ -3565,6 +3821,223 @@ async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(msg, parse_mode="HTML")
+
+
+async def allow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🆕 특별관리 대책방에서 owner 가 다른 사용자를 화이트리스트에 추가.
+    
+    사용법:
+      1. 추가할 사람의 메시지를 인용(답장)하고 → /allow
+      2. /allow (단독) → 안내 메시지
+    """
+    import html as _html
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
+
+    chat_id = chat.id
+
+    # 개인방에선 의미 없음
+    if chat.type == "private":
+        await update.message.reply_text(
+            "ℹ️ <code>/allow</code> 명령은 그룹방 전용입니다.\n"
+            "특별관리 대책방에서 사용하세요.",
+            parse_mode="HTML",
+        )
+        return
+
+    # 특별관리 대책방인지 체크
+    if not await is_special_monitor_chat(chat_id):
+        await update.message.reply_text(
+            "ℹ️ 이 방은 특별관리 대책방이 아니어서\n"
+            "<code>/allow</code> 명령은 효과가 없습니다.\n"
+            "(일반 그룹방은 누구나 봇을 사용할 수 있습니다.)",
+            parse_mode="HTML",
+        )
+        return
+
+    # 승인된 방인지 체크
+    if not await is_chat_authorized(chat_id):
+        await update.message.reply_text(
+            "❌ 이 방은 아직 봇 사용 승인이 안 된 방입니다.\n"
+            "<code>/start</code> 로 먼저 승인 신청을 해주세요.",
+            parse_mode="HTML",
+        )
+        return
+
+    # 권한 체크 — owner 또는 봇 관리자만
+    is_admin = await is_bot_admin_user(user.id)
+    allowed_list = await list_chat_allowed_users(chat_id)
+    is_owner = any(
+        int(r.get("user_id", 0)) == int(user.id) and bool(r.get("is_owner"))
+        for r in allowed_list
+    )
+
+    if not (is_owner or is_admin):
+        await update.message.reply_text(
+            "❌ <b>권한 없음</b>\n\n"
+            "이 방의 봇 사용자 추가는 <b>owner</b> 또는 <b>봇 관리자</b>만 가능합니다.\n"
+            "<code>/allowed</code> 명령으로 현재 owner 를 확인할 수 있습니다.",
+            parse_mode="HTML",
+        )
+        return
+
+    # reply 대상 추출
+    reply_msg = update.message.reply_to_message
+    if not reply_msg or not reply_msg.from_user:
+        await update.message.reply_text(
+            "ℹ️ <b>사용법</b>\n\n"
+            "1️⃣ 추가할 분의 메시지에 <b>답장(reply)</b>하면서\n"
+            "2️⃣ <code>/allow</code> 라고 입력하세요.\n\n"
+            "그러면 그 분이 이 방의 봇을 사용할 수 있게 됩니다.\n\n"
+            "<i>현재 등록된 사용자: <code>/allowed</code></i>",
+            parse_mode="HTML",
+        )
+        return
+
+    target = reply_msg.from_user
+    if target.is_bot:
+        await update.message.reply_text("❌ 봇은 추가할 수 없습니다.")
+        return
+
+    target_name = target.full_name or target.username or f"user_{target.id}"
+    ok = await add_chat_allowed_user(
+        chat_id=chat_id,
+        user_id=target.id,
+        user_name=target_name,
+        is_owner=False,
+        added_by=user.id,
+    )
+
+    if ok:
+        # 안내 메시지 캐시 클리어 (그 사람이 다시 명령 보낼 때 정상 작동)
+        _unallowed_notified.discard((chat_id, target.id))
+        await update.message.reply_text(
+            f"✅ <b>{_html.escape(target_name)}</b> 님이\n"
+            f"이 방의 봇 사용자로 등록되었습니다.\n\n"
+            f"이제 이 분도 봇을 사용할 수 있습니다.",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text(
+            "❌ 등록 실패. 잠시 후 다시 시도해주세요.\n"
+            "(DB 마이그레이션이 적용됐는지 관리자에게 문의)",
+            parse_mode="HTML",
+        )
+
+
+async def disallow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🆕 owner 가 화이트리스트에서 사용자 제거.
+    사용법: 제거할 사람 메시지에 reply 후 /disallow
+    """
+    import html as _html
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
+    chat_id = chat.id
+
+    if chat.type == "private":
+        await update.message.reply_text(
+            "ℹ️ <code>/disallow</code> 명령은 그룹방 전용입니다.",
+            parse_mode="HTML",
+        )
+        return
+
+    if not await is_special_monitor_chat(chat_id):
+        await update.message.reply_text(
+            "ℹ️ 이 방은 특별관리 대책방이 아닙니다.",
+            parse_mode="HTML",
+        )
+        return
+
+    is_admin = await is_bot_admin_user(user.id)
+    allowed_list = await list_chat_allowed_users(chat_id)
+    is_owner = any(
+        int(r.get("user_id", 0)) == int(user.id) and bool(r.get("is_owner"))
+        for r in allowed_list
+    )
+    if not (is_owner or is_admin):
+        await update.message.reply_text(
+            "❌ owner 또는 봇 관리자만 제거할 수 있습니다.",
+            parse_mode="HTML",
+        )
+        return
+
+    reply_msg = update.message.reply_to_message
+    if not reply_msg or not reply_msg.from_user:
+        await update.message.reply_text(
+            "ℹ️ 제거할 분의 메시지에 답장(reply)하며 <code>/disallow</code> 입력하세요.",
+            parse_mode="HTML",
+        )
+        return
+
+    target = reply_msg.from_user
+    target_name = target.full_name or target.username or f"user_{target.id}"
+
+    # owner 가 자기 자신을 제거하는 건 막음
+    if int(target.id) == int(user.id):
+        await update.message.reply_text(
+            "❌ owner 본인은 제거할 수 없습니다.\n"
+            "owner 변경은 관리자 페이지에서 가능합니다.",
+            parse_mode="HTML",
+        )
+        return
+
+    ok = await remove_chat_allowed_user(chat_id, target.id)
+    if ok:
+        await update.message.reply_text(
+            f"✅ <b>{_html.escape(target_name)}</b> 님을 봇 사용자에서 제거했습니다.",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text("❌ 제거 실패. 잠시 후 다시 시도해주세요.")
+
+
+async def allowed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🆕 이 방의 화이트리스트 사용자 목록 표시."""
+    import html as _html
+    chat = update.effective_chat
+    if not chat:
+        return
+    chat_id = chat.id
+
+    if chat.type == "private":
+        await update.message.reply_text(
+            "ℹ️ <code>/allowed</code> 명령은 그룹방 전용입니다.",
+            parse_mode="HTML",
+        )
+        return
+
+    if not await is_special_monitor_chat(chat_id):
+        await update.message.reply_text(
+            "ℹ️ 이 방은 특별관리 대책방이 아니라\n"
+            "사용자 제한이 없습니다 (방 멤버 모두 사용 가능).",
+            parse_mode="HTML",
+        )
+        return
+
+    rows = await list_chat_allowed_users(chat_id)
+    if not rows:
+        await update.message.reply_text(
+            "📋 등록된 봇 사용자가 없습니다.\n"
+            "<i>(첫 명령 사용자가 자동으로 owner 로 등록됩니다.)</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    lines = ["🛡 <b>이 방의 봇 사용자</b>"]
+    lines.append("━" * 14)
+    for r in rows:
+        name = _html.escape(r.get("user_name") or f"user_{r.get('user_id')}")
+        crown = "👑 " if r.get("is_owner") else "   "
+        lines.append(f"{crown}{name}")
+    lines.append("")
+    lines.append("<i>👑 = owner (다른 사용자 추가/제거 가능)</i>")
+    lines.append("<i>추가: 추가할 분 메시지에 답장 + <code>/allow</code></i>")
+    lines.append("<i>제거: 제거할 분 메시지에 답장 + <code>/disallow</code></i>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def prereq_church_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4082,29 +4555,33 @@ def main():
     app.add_handler(CommandHandler("chatid",   chatid_command))
     app.add_handler(CommandHandler("approve",  approve_command))
     app.add_handler(CommandHandler("deny",     deny_command))
+    # 🆕 특별관리 대책방 화이트리스트 관리
+    app.add_handler(CommandHandler("allow",    allow_command))
+    app.add_handler(CommandHandler("disallow", disallow_command))
+    app.add_handler(CommandHandler("allowed",  allowed_command))
 
     app.add_handler(CallbackQueryHandler(button_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
 
     # 📅 스케줄 (python-telegram-bot v20: 월=0, 화=1, 수=2, 목=3, 금=4, 토=5, 일=6)
     if app.job_queue is not None:
-        # 🆕 매주 수요일 07:00 KST — 봇 사용자(개인방) 모두에게 타겟 결석자 심방계획 요청
+        # 🆕 매주 수요일 08:00 KST — 봇 사용자(개인방) 모두에게 타겟 결석자 심방계획 요청
         app.job_queue.run_daily(
             wednesday_visit_plan_request_job,
-            time=dtime(hour=7, minute=0, tzinfo=KST),
+            time=dtime(hour=8, minute=0, tzinfo=KST),
             days=(2,),  # 수요일
             name="wednesday_personal_visit_plan",
         )
-        logger.info("📅 [매주 수요일 07:00 KST] 개인방 타겟 결석자 심방계획 요청")
+        logger.info("📅 [매주 수요일 08:00 KST] 개인방 타겟 결석자 심방계획 요청")
 
-        # 🆕 매주 수요일 07:00 KST — 특별관리 그룹방에 피드백/심방계획 요청
+        # 🆕 매주 수요일 08:00 KST — 특별관리 그룹방에 피드백/심방계획 요청
         app.job_queue.run_daily(
             weekly_reminder_job,
-            time=dtime(hour=7, minute=0, tzinfo=KST),
+            time=dtime(hour=8, minute=0, tzinfo=KST),
             days=(2,),  # 수요일
             name="wednesday_special_reminder",
         )
-        logger.info("📅 [매주 수요일 07:00 KST] 특별관리 그룹방 피드백 회의 요청")
+        logger.info("📅 [매주 수요일 08:00 KST] 특별관리 그룹방 피드백 회의 요청")
 
         # 🆕 매주 수요일 00:00 KST — 주차 자동 전환 (선택적)
         app.job_queue.run_daily(
@@ -4162,7 +4639,7 @@ def main():
         return False
 
     async def trigger_weekly_visit_plan(request):
-        """🌅 매주 수요일 07:00 KST — 개인방 사용자에게 타겟 결석자 심방계획 요청.
+        """🌅 매주 수요일 08:00 KST — 개인방 사용자에게 타겟 결석자 심방계획 요청.
         Cloud Scheduler 가 호출."""
         if not _check_scheduler_auth(request):
             return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
@@ -4178,7 +4655,7 @@ def main():
             return web.json_response({"ok": False, "error": str(e)}, status=500)
 
     async def trigger_special_reminder(request):
-        """🚨 매주 수요일 07:00 KST — 특별관리 그룹방에 피드백/심방계획 요청.
+        """🚨 매주 수요일 08:00 KST — 특별관리 그룹방에 피드백/심방계획 요청.
         Cloud Scheduler 가 호출."""
         if not _check_scheduler_auth(request):
             return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
@@ -4214,16 +4691,87 @@ def main():
     BROADCAST_TOKEN = os.environ.get("BROADCAST_TOKEN", os.environ.get("SCHEDULER_TOKEN", ""))
 
     async def _resolve_target_chats(scope: dict) -> list:
-        """scope 에 따라 발송 대상 활성 그룹방 목록 반환"""
+        """scope 에 따라 발송 대상 활성 그룹방 목록 반환
+
+        지원하는 scope.type:
+          - all          : 전체 그룹방
+          - church       : 특정 교회 전체 부서
+          - dept         : 특정 교회 + 특정 부서
+          - all_dept     : 모든 교회의 특정 부서 (지파관리자)
+          - special      : 모든 특별관리 대상자 대책방
+          - special_church : 특정 교회의 특별관리 대상자 대책방
+          - special_dept   : 특정 교회·부서의 특별관리 대상자 대책방
+        """
         scope_type = (scope or {}).get("type") or "all"
         scope_church = (scope or {}).get("church")
         scope_dept = (scope or {}).get("dept")
 
+        # 🆕 특별관리 대상자 대책방 발송
+        if scope_type in ("special", "special_church", "special_dept"):
+            sp_qs = "special_management_targets?select=name,dept,phone_last4,monitor_chat_id,region_name,zone_name&monitor_chat_id=not.is.null&limit=5000"
+            sp_rows = await sb_get(sp_qs) or []
+
+            # name+dept+phone_last4 → registry 매칭으로 church 찾기
+            reg_rows = await sb_get(
+                "church_member_registry?select=name,dept,phone_last4,church&limit=50000"
+            ) or []
+            # (name, dept, phone) → church 매핑
+            reg_map = {}
+            for r in reg_rows:
+                key = (r.get("name") or "", r.get("dept") or "", r.get("phone_last4") or "")
+                reg_map[key] = r.get("church") or ""
+
+            # 결과로 변환
+            chats = []
+            seen_chat_ids = set()
+            for s in sp_rows:
+                cid = s.get("monitor_chat_id")
+                if not cid or cid in seen_chat_ids:
+                    continue
+                key = (s.get("name") or "", s.get("dept") or "", s.get("phone_last4") or "")
+                church = reg_map.get(key, "")
+
+                # scope 별 필터
+                if scope_type == "special_church" and scope_church and church != scope_church:
+                    continue
+                if scope_type == "special_dept":
+                    if scope_church and church != scope_church:
+                        continue
+                    if scope_dept and s.get("dept") != scope_dept:
+                        continue
+
+                seen_chat_ids.add(cid)
+                title = f"{s.get('name','?')} 대책방"
+                chats.append({
+                    "chat_id": cid,
+                    "chat_title": title,
+                    "church": church,
+                    "dept": s.get("dept"),
+                    "region_name": s.get("region_name"),
+                    "zone_name": s.get("zone_name"),
+                })
+
+            if not chats:
+                return []
+
+            # 봇 활성 권한 체크
+            chat_ids = [c["chat_id"] for c in chats]
+            chat_ids_str = ",".join(str(c) for c in chat_ids)
+            auth_rows = await sb_get(
+                f"bot_authorized_chats?select=chat_id&chat_id=in.({chat_ids_str})&is_active=eq.true&limit=5000"
+            ) or []
+            authorized = {r["chat_id"] for r in auth_rows}
+            return [c for c in chats if c["chat_id"] in authorized]
+
+        # 일반 그룹방 발송
         qs = "telegram_chat_scope?select=chat_id,chat_title,church,dept,region_name,zone_name&limit=5000"
         if scope_type == "church" and scope_church:
             qs += f"&church=eq.{quote(scope_church)}"
         elif scope_type == "dept" and scope_church and scope_dept:
             qs += f"&church=eq.{quote(scope_church)}&dept=eq.{quote(scope_dept)}"
+        elif scope_type == "all_dept" and scope_dept:
+            # 🆕 모든 교회의 특정 부서
+            qs += f"&dept=eq.{quote(scope_dept)}"
 
         scope_rows = await sb_get(qs) or []
         chat_ids = [r["chat_id"] for r in scope_rows if r.get("chat_id")]
@@ -4249,14 +4797,28 @@ def main():
         if req_role == "zipa":
             return scope, None  # 모두 허용
         if req_role == "church":
-            # 자기 교회만
+            # 자기 교회만 — special/special_church 도 자기 교회 한정
             if scope_type == "all":
                 return ({"type": "church", "church": req_church}, None)
+            if scope_type == "all_dept":
+                # 교회관리자는 모든 교회 부서 발송 불가 → 자기 교회 부서로 강제
+                return ({"type": "dept", "church": req_church, "dept": scope_dept}, None)
+            if scope_type == "special":
+                # 자기 교회 특별관리만
+                return ({"type": "special_church", "church": req_church}, None)
+            if scope_type in ("special_church", "special_dept"):
+                if scope_church != req_church:
+                    return None, "교회관리자는 자기 교회만 발송 가능"
+                return scope, None
             if scope_church != req_church:
                 return None, "교회관리자는 자기 교회만 발송 가능"
             return scope, None
         if req_role == "dept":
             # 자기 교회 + 자기 부서만
+            if scope_type == "special_dept":
+                if scope_church != req_church or scope_dept != req_dept:
+                    return None, "부서관리자는 자기 부서만 발송 가능"
+                return scope, None
             if scope_type != "dept" or scope_church != req_church or scope_dept != req_dept:
                 return None, "부서관리자는 자기 부서만 발송 가능"
             return scope, None
@@ -4367,13 +4929,24 @@ def main():
         # 허용 태그: <b>, <strong>, <i>, <em>, <u>, <s>, <strike>, <code>, <pre>, <a>, <br>
         # 다른 태그는 그대로 출력 (Telegram이 무시) — 위험한 것 없음
         # XSS 위험: 봇은 텍스트만 보내고 HTML 렌더는 Telegram 클라이언트에서만 발생 → 안전
-        prefixed_message = (
-            "📢 <b>지파 관리자 안내</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{message}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "<i>본 메시지는 관리자 페이지에서 발송됨</i>"
-        )
+        # 🆕 특별관리 대상자 대책방엔 다른 prefix
+        sc_type = (scope or {}).get("type") or "all"
+        if str(sc_type).startswith("special"):
+            prefixed_message = (
+                "🚨 <b>특별관리 안내</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"{message}\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "<i>본 메시지는 특별관리 대책방으로 발송됨</i>"
+            )
+        else:
+            prefixed_message = (
+                "📢 <b>지파 관리자 안내</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"{message}\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "<i>본 메시지는 관리자 페이지에서 발송됨</i>"
+            )
 
         sent = 0
         failed = 0
