@@ -998,6 +998,10 @@ async def remove_chat_allowed_user(chat_id: int, user_id: int) -> bool:
 # 🆕 한 번 안내 메시지를 보낸 (chat_id, user_id) 쌍은 메모리에 저장 — 같은 사람에게 반복 안내 방지
 _unallowed_notified: set[tuple[int, int]] = set()
 
+# 🆕 v6.0: 승인 신청이 보내진 관리자 DM 메시지 추적 (target_chat_id → list of (admin_uid, msg_id))
+#   - 한 관리자가 승인하면 다른 관리자들의 DM 메시지에도 "이미 처리됨" 표시
+_pending_admin_msgs: dict[int, list[tuple[int, int]]] = {}
+
 
 async def ensure_user_allowed_in_special_chat(update: Update) -> tuple[bool, bool]:
     """🆕 특별관리 대책방에서 유저 권한 체크.
@@ -1905,7 +1909,20 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         allowed, _ = await ensure_user_allowed_in_special_chat(update)
         if not allowed:
-            return  # 등록 안된 사용자 → 조용히 무시 (1회 안내 후)
+            # 🆕 콜백은 화면에 안내가 안 보일 수 있으니 q.answer 로 alert 표시
+            try:
+                user = update.effective_user
+                logger.info(
+                    "🛡 [차단] 콜백 — chat=%s user=%s(%s) data=%s",
+                    chat_id, user.id if user else '?', (user.full_name if user else '?'), data
+                )
+                await q.answer(
+                    "🛡 이 방의 봇은 지정된 분만 사용 가능합니다.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            return
     except Exception as _e:
         logger.warning("ensure_user_allowed_in_special_chat (callback): %s", _e)
 
@@ -4296,21 +4313,30 @@ async def request_approval_callback(update: Update, context: ContextTypes.DEFAUL
 
     delivered = 0
     failed = 0
+    sent_msgs: list[tuple[int, int]] = []   # (admin_uid, msg_id)
     for admin in routed_admins:
         admin_uid = admin.get("user_id")
         if not admin_uid:
             continue
         try:
-            await context.bot.send_message(
+            sent = await context.bot.send_message(
                 chat_id=admin_uid,
                 text=admin_msg,
                 parse_mode="HTML",
                 reply_markup=approve_kb,
             )
             delivered += 1
+            try:
+                sent_msgs.append((int(admin_uid), int(sent.message_id)))
+            except Exception:
+                pass
         except Exception as e:
             logger.warning("관리자 %s DM 실패: %s", admin_uid, e)
             failed += 1
+
+    # 🆕 v6.0: 다른 관리자에게도 알릴 수 있도록 메시지 추적
+    if sent_msgs:
+        _pending_admin_msgs[int(chat_id)] = sent_msgs
 
     # 신청자에게 결과 안내
     if delivered > 0:
@@ -4387,6 +4413,26 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.info("승인된 방에 알림 발송 실패 (봇이 아직 방에 있지 않을 수 있음): %s", e)
 
+    # 🆕 v6.0: 다른 관리자들에게도 "이미 처리됨" 동기화 표시
+    try:
+        pending = _pending_admin_msgs.pop(int(target_chat_id), [])
+        for (admin_uid, msg_id) in pending:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=admin_uid,
+                    message_id=msg_id,
+                    text=(
+                        f"✅ <b>승인 완료됨</b>\n\n"
+                        f"<i>{_html.escape(admin_name)} 님이 <code>/approve</code> 명령으로 승인했습니다.</i>\n"
+                        f"<i>(Chat ID: {target_chat_id})</i>"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e2:
+                logger.info("동기화 알림 실패 admin=%s msg=%s: %s", admin_uid, msg_id, e2)
+    except Exception as e:
+        logger.info("/approve 동기화 실패: %s", e)
+
 
 async def deny_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """관리자 전용: /deny <chat_id> 로 방 거부."""
@@ -4453,6 +4499,25 @@ async def admin_approve_callback(update: Update, context: ContextTypes.DEFAULT_T
         q.message.text_html + f"\n\n━━━━━━━━━━━━━━━━━━━━\n✅ <b>{_html.escape(admin_name)}</b> 님이 승인 완료",
         parse_mode="HTML",
     )
+
+    # 🆕 v6.0: 다른 관리자들에게도 "이미 승인됨" 동기화 표시
+    try:
+        pending = _pending_admin_msgs.pop(int(target_chat_id), [])
+        my_msg_id = q.message.message_id
+        for (admin_uid, msg_id) in pending:
+            if int(admin_uid) == int(user.id) and int(msg_id) == int(my_msg_id):
+                continue  # 본인 메시지는 위에서 이미 처리
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=admin_uid,
+                    message_id=msg_id,
+                    text=q.message.text_html + f"\n\n━━━━━━━━━━━━━━━━━━━━\n✅ <b>{_html.escape(admin_name)}</b> 님이 먼저 승인 처리 완료",
+                    parse_mode="HTML",
+                )
+            except Exception as e2:
+                logger.info("다른 관리자 메시지 갱신 실패 admin=%s msg=%s: %s", admin_uid, msg_id, e2)
+    except Exception as e:
+        logger.info("승인 동기화 실패: %s", e)
     try:
         # 🆕 v5.8: 승인 후 scope 상태 따라 다음 단계 안내
         existing_scope = await get_chat_scope(target_chat_id)
@@ -4527,10 +4592,39 @@ async def admin_deny_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await q.answer()
     admin_name = user.full_name or user.username or f"user_{user.id}"
+
+    # 거부 대상 chat_id 추출 (admin_deny:<chat_id>)
+    data = q.data or ""
+    target_chat_id = None
+    try:
+        target_chat_id = int(data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        pass
+
     await q.edit_message_text(
         q.message.text_html + f"\n\n━━━━━━━━━━━━━━━━━━━━\n❌ <b>{_html.escape(admin_name)}</b> 님이 거부",
         parse_mode="HTML",
     )
+
+    # 🆕 v6.0: 다른 관리자들에게도 동기화 표시
+    if target_chat_id is not None:
+        try:
+            pending = _pending_admin_msgs.pop(int(target_chat_id), [])
+            my_msg_id = q.message.message_id
+            for (admin_uid, msg_id) in pending:
+                if int(admin_uid) == int(user.id) and int(msg_id) == int(my_msg_id):
+                    continue
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=admin_uid,
+                        message_id=msg_id,
+                        text=q.message.text_html + f"\n\n━━━━━━━━━━━━━━━━━━━━\n❌ <b>{_html.escape(admin_name)}</b> 님이 먼저 거부 처리",
+                        parse_mode="HTML",
+                    )
+                except Exception as e2:
+                    logger.info("다른 관리자 메시지 갱신 실패 admin=%s msg=%s: %s", admin_uid, msg_id, e2)
+        except Exception as e:
+            logger.info("거부 동기화 실패: %s", e)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
