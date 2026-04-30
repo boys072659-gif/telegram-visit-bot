@@ -396,13 +396,16 @@ async def get_active_week() -> tuple[str, str]:
 # 컨텍스트 (세션)
 # ═════════════════════════════════════════════════════════════════════════════
 async def get_ctx(chat_id: int):
+    """🔧 v6.0: 항상 dict 반환 (None 반환 금지) — 호출자의 .get() NoneType 에러 방지"""
     try:
         rows = await sb_rpc("get_telegram_visit_context", {"p_chat_id": chat_id})
         if rows:
-            return rows[0] if isinstance(rows, list) else rows
+            result = rows[0] if isinstance(rows, list) else rows
+            if isinstance(result, dict):
+                return result
     except Exception as e:
         logger.warning("get_ctx failed: %s", e)
-    return None
+    return {}   # 🆕 None 대신 빈 dict
 
 async def save_ctx(chat_id: int, **kwargs):
     payload = {"p_chat_id": chat_id}
@@ -919,8 +922,19 @@ async def list_chat_allowed_users(chat_id: int) -> list[dict]:
         ) or []
         return rows
     except Exception as e:
-        logger.warning("list_chat_allowed_users 실패: %s", e)
+        # 🆕 v6.0: 테이블이 없으면 (마이그레이션 안 됨) 화이트리스트 비활성화
+        msg = str(e).lower()
+        if 'does not exist' in msg or 'relation' in msg or 'pgrst205' in msg or '404' in msg:
+            global _chat_allowed_users_table_exists
+            _chat_allowed_users_table_exists = False
+            logger.info("chat_allowed_users 테이블 없음 — 화이트리스트 비활성화 (v6.0 패치 미적용)")
+        else:
+            logger.warning("list_chat_allowed_users 실패: %s", e)
         return []
+
+
+# 🆕 v6.0: 테이블 존재 캐시 (v6.0 패치 SQL 미적용 환경에서 화이트리스트 자동 비활성)
+_chat_allowed_users_table_exists: bool = True
 
 
 async def is_user_allowed_in_chat(chat_id: int, user_id: int) -> bool:
@@ -1022,6 +1036,10 @@ async def ensure_user_allowed_in_special_chat(update: Update) -> tuple[bool, boo
 
     chat_id = chat.id
     user_id = user.id
+
+    # 🆕 v6.0: chat_allowed_users 테이블이 없으면 (v6.0 패치 미적용) 화이트리스트 비활성
+    if not _chat_allowed_users_table_exists:
+        return True, False
 
     # 봇 관리자는 무조건 통과
     if await is_bot_admin_user(user_id):
@@ -1675,6 +1693,14 @@ async def _on_scope_text_input(update: Update, chat_id: int, text: str):
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 🆕 v6.0: 특별관리 대책방 화이트리스트 체크 (가장 먼저)
+    try:
+        allowed, _ = await ensure_user_allowed_in_special_chat(update)
+        if not allowed:
+            return
+    except Exception as _e:
+        logger.warning("ensure_user_allowed_in_special_chat (start): %s", _e)
+
     chat_id = update.effective_chat.id
     chat_title = update.effective_chat.title or update.effective_chat.full_name or ""
     week_key, week_label = await get_active_week()
@@ -1784,6 +1810,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 🆕 v6.0: 특별관리 대책방 화이트리스트 체크
+    try:
+        allowed, _ = await ensure_user_allowed_in_special_chat(update)
+        if not allowed:
+            return
+    except Exception as _e:
+        logger.warning("ensure_user_allowed_in_special_chat (menu): %s", _e)
+
     week_key, week_label = await get_active_week()
     txt = (
         "🏠 *메인 메뉴*\n\n"
@@ -1796,10 +1830,24 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⌨️ 하단 키보드 메뉴 활성화", reply_markup=kb_reply_main(is_private_chat(update)))
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 🆕 v6.0: 화이트리스트 체크
+    try:
+        allowed, _ = await ensure_user_allowed_in_special_chat(update)
+        if not allowed:
+            return
+    except Exception:
+        pass
     await _send_help(update)
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 🆕 v6.0: 화이트리스트 체크
+    try:
+        allowed, _ = await ensure_user_allowed_in_special_chat(update)
+        if not allowed:
+            return
+    except Exception:
+        pass
     chat_id = update.effective_chat.id
     await clear_tmp(chat_id)
     await update.message.reply_text("🚫 현재 작업을 취소했습니다.\n/menu 로 메인 메뉴로.")
