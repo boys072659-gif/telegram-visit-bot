@@ -1899,6 +1899,16 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await q.answer()
 
+    # 🆕 v6.0: 특별관리 대책방 화이트리스트 체크
+    #   인라인 버튼 (1번/2번 체크, 심방예정일/심방계획 입력, 메인 메뉴 등) 도 막아야 함
+    #   특별관리 대책방이 아니면 영향 없음
+    try:
+        allowed, _ = await ensure_user_allowed_in_special_chat(update)
+        if not allowed:
+            return  # 등록 안된 사용자 → 조용히 무시 (1회 안내 후)
+    except Exception as _e:
+        logger.warning("ensure_user_allowed_in_special_chat (callback): %s", _e)
+
     try:
         # ── 메인 메뉴 ──
         if data == "m:home":
@@ -2328,6 +2338,15 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """텍스트 입력 핸들러 — 리플라이 키보드 / 지역·구역 / 심방 단계 / 특별관리 3·4번"""
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
+
+    # 🆕 v6.0: 특별관리 대책방 화이트리스트 체크
+    #   '📋 결석자 심방', '🚨 특별관리결석자' 등 텍스트 입력도 막아야 함
+    try:
+        allowed, _ = await ensure_user_allowed_in_special_chat(update)
+        if not allowed:
+            return
+    except Exception as _e:
+        logger.warning("ensure_user_allowed_in_special_chat (text): %s", _e)
 
     # ── 0) 리플라이 키보드 (하단 버튼) 라벨 라우팅 ──────────────────────
     #  - 컨텍스트보다 우선하지만, 사용자가 입력 중이면 의도와 다를 수 있으니
