@@ -934,7 +934,37 @@ async def list_chat_allowed_users(chat_id: int) -> list[dict]:
 
 
 # 🆕 v6.0: 테이블 존재 캐시 (v6.0 패치 SQL 미적용 환경에서 화이트리스트 자동 비활성)
+#   - True: 테이블 정상 작동
+#   - False: 테이블 미존재 → 화이트리스트 비활성 (10분 후 재확인)
 _chat_allowed_users_table_exists: bool = True
+_chat_allowed_users_last_check: float = 0.0   # 마지막 체크 timestamp
+
+
+async def _refresh_table_cache_if_stale():
+    """🆕 v6.0: 테이블 캐시가 False(미존재)로 설정된 후 10분 지나면 재확인.
+    DB 마이그레이션 후 자동으로 화이트리스트가 다시 활성화되도록.
+    """
+    global _chat_allowed_users_table_exists, _chat_allowed_users_last_check
+    import time
+    now = time.time()
+    if _chat_allowed_users_table_exists:
+        return  # 이미 활성 — 재확인 불필요
+    if now - _chat_allowed_users_last_check < 600:  # 10분 이내면 스킵
+        return
+    _chat_allowed_users_last_check = now
+    try:
+        # 가벼운 query 로 테이블 존재 확인
+        await sb_get("chat_allowed_users?select=chat_id&limit=1")
+        _chat_allowed_users_table_exists = True
+        logger.info("✅ chat_allowed_users 테이블 다시 활성화됨 (마이그레이션 적용 감지)")
+    except Exception as e:
+        msg = str(e).lower()
+        if 'does not exist' in msg or 'relation' in msg or 'pgrst205' in msg or '404' in msg:
+            # 여전히 없음
+            pass
+        else:
+            # 다른 에러 — 일시적일 수 있으니 다음 기회에 재시도
+            logger.info("테이블 재확인 일시 실패: %s", e)
 
 
 async def is_user_allowed_in_chat(chat_id: int, user_id: int) -> bool:
@@ -1037,8 +1067,21 @@ async def ensure_user_allowed_in_special_chat(update: Update) -> tuple[bool, boo
     chat_id = chat.id
     user_id = user.id
 
+    # 🆕 v6.0: 캐시가 False면 주기적 재확인 (마이그레이션 적용 감지)
+    await _refresh_table_cache_if_stale()
+
     # 🆕 v6.0: chat_allowed_users 테이블이 없으면 (v6.0 패치 미적용) 화이트리스트 비활성
     if not _chat_allowed_users_table_exists:
+        # 특별관리 대책방인지부터 확인 — 그렇지 않은 일반방은 영향 없으니 조용히 통과
+        is_sp = await is_special_monitor_chat(chat_id)
+        if is_sp:
+            # 🚨 매우 심각 — 특별관리 대책방인데 화이트리스트 시스템 작동 안 함
+            logger.error(
+                "🚨 [화이트리스트 비활성] 특별관리 대책방에서 권한 체크 불가! "
+                "chat_id=%s user=%s | chat_allowed_users 테이블이 DB에 없습니다. "
+                "yago_patch_v58_to_v60.sql 을 즉시 적용하세요.",
+                chat_id, user_id
+            )
         return True, False
 
     # 봇 관리자는 무조건 통과
@@ -1618,9 +1661,14 @@ async def _on_scope_text_input(update: Update, chat_id: int, text: str):
     step = ctx.get("editing_step")
     user = update.effective_user
 
+    # 🆕 v6.0: 디버그 로그 — 어느 단계인지 명확히 추적
+    logger.info(
+        "[scope_text] chat=%s user=%s step=%s text=%r ctx_keys=%s",
+        chat_id, user.id if user else '?', step, text,
+        list(ctx.keys()) if ctx else []
+    )
+
     if step == "awaiting_scope_region_text":
-        # 지역 입력 — region_filter 필드에 임시 저장 (editing_region 대신)
-        # 이유: set_telegram_visit_context RPC 가 editing_region 파라미터를 받지 않음
         region = text.strip()
         if not region:
             await safe_reply_text(
@@ -1634,21 +1682,26 @@ async def _on_scope_text_input(update: Update, chat_id: int, text: str):
         await save_ctx(chat_id, region_filter=region, editing_step="awaiting_scope_zone_text")
         church = ctx.get("church_filter") or ""
         dept = ctx.get("dept_filter") or ""
+        # 🆕 v6.0: 안내 메시지를 더 크고 명확하게 (글씨 잘 보이게)
         await safe_reply_text(
             update.message,
-            f"📋 *방 범위 설정 (4/4 단계)*\n"
+            f"✅ <b>지역 입력 완료: {_html_escape(region)}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"1️⃣ ✅ *교회*: {md(church)}\n"
-            f"2️⃣ ✅ *부서*: {md(dept)}\n"
-            f"3️⃣ ✅ *지역*: {md(region)}\n"
-            f"4️⃣ ⏳ *구역* (선택) ← 지금 단계\n\n"
+            f"📋 <b>방 범위 설정 (3/4 완료)</b>\n\n"
+            f"1️⃣ ✅ 교회: <b>{_html_escape(church)}</b>\n"
+            f"2️⃣ ✅ 부서: <b>{_html_escape(dept)}</b>\n"
+            f"3️⃣ ✅ 지역: <b>{_html_escape(region)}</b>\n"
+            f"4️⃣ ⏳ <b>구역 (마지막 단계)</b>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🏘 *구역까지 입력하시려면 구역 이름을 입력*\n\n"
-            f"예시: `1-1` `1팀1` `2-3` `사랑-1` `노민-2`\n\n"
+            f"🏘 <b>구역명을 입력하세요</b> 👇\n\n"
+            f"<b>예시:</b>\n"
+            f"   • <code>1-1</code>  • <code>1팀1</code>\n"
+            f"   • <code>2-3</code>  • <code>2팀3</code>\n"
+            f"   • <code>사랑-1</code>  • <code>노민-2</code>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏭ *구역 없이 마치려면 아래 [지역까지만 완료] 버튼*\n"
-            f"_(구역까지 설정하면 본인 구역 결석자만 표시됨)_",
-            parse_mode="Markdown",
+            f"⏭ <i>구역 없이 마치려면 아래</i>\n"
+            f"<i>[지역까지만 완료] 버튼을 누르세요</i>",
+            parse_mode="HTML",
             reply_markup=kb_setup_zone(),
         )
         return True
@@ -1657,12 +1710,21 @@ async def _on_scope_text_input(update: Update, chat_id: int, text: str):
         zone = text.strip()
         church = ctx.get("church_filter") or ""
         dept = ctx.get("dept_filter") or ""
-        region = ctx.get("region_filter") or ""  # 🔧 editing_region 대신 region_filter 사용
+        region = ctx.get("region_filter") or ""
 
         if not region:
+            # 🆕 v6.0: 디버그 강화 — 왜 region 이 사라졌는지 추적
+            logger.error(
+                "[scope_text] region 누락! chat=%s ctx=%s text=%r — 사용자가 다시 처음으로 가게 됨",
+                chat_id, ctx, text
+            )
             await safe_reply_text(
                 update.message,
-                "❌ 지역 정보가 세션에서 사라졌습니다.\n/setup 으로 다시 시작해주세요.",
+                "❌ <b>지역 정보가 사라졌습니다</b>\n\n"
+                "잠시 다른 분이 동시에 같은 방에서 봇을 사용했을 수 있습니다.\n"
+                "다시 처음부터 시작해주세요.\n\n"
+                "👉 <code>/setup</code> 또는 <code>/start</code>",
+                parse_mode="HTML",
             )
             return True
 
@@ -1680,11 +1742,14 @@ async def _on_scope_text_input(update: Update, chat_id: int, text: str):
         new_scope = {"church": church, "dept": dept, "region_name": region, "zone_name": zone}
         await safe_reply_text(
             update.message,
-            f"🎉 *방 범위 설정 완료*\n\n"
-            f"📌 {md(scope_label(new_scope))}\n"
-            f"👤 최초 설정자: *{md(owner_name or '(미기록)')}*\n\n"
-            f"이제 `📋 결석자 심방` 에서 이 범위의 결석자만 표시됩니다.",
-            parse_mode="Markdown",
+            f"🎉 <b>방 범위 설정 완료!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📌 {_html_escape(scope_label(new_scope))}\n"
+            f"👤 최초 설정자: <b>{_html_escape(owner_name or '(미기록)')}</b>\n\n"
+            f"이제 <b>📋 결석자 심방</b>에서 이 범위의 결석자만 표시됩니다.\n\n"
+            f"💡 범위 변경(최초 설정자만): /setup\n"
+            f"💡 현재 범위 확인: /myscope",
+            parse_mode="HTML",
             reply_markup=kb_main_menu(is_private_chat(update)),
         )
         return True
@@ -2097,10 +2162,20 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dept = ctx.get("dept_filter") or ""
             await save_ctx(chat_id, editing_step="awaiting_scope_region_text")
             await q.edit_message_text(
-                f"✅ *① 교회*: {md(church)}\n"
-                f"✅ *② 부서*: {md(dept)}\n\n"
-                f"*③ 지역* 이름을 다시 입력하세요.",
-                parse_mode="Markdown",
+                f"📋 <b>방 범위 설정 (2/4 완료)</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"1️⃣ ✅ 교회: <b>{_html_escape(church)}</b>\n"
+                f"2️⃣ ✅ 부서: <b>{_html_escape(dept)}</b>\n"
+                f"3️⃣ ⏳ <b>지역 (지금 단계)</b> 👈\n"
+                f"4️⃣ ⏸️ 구역 (다음 단계)\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📍 <b>본인 담당 지역명을 입력하세요</b> 👇\n\n"
+                f"<b>예시:</b>\n"
+                f"   • <code>강북</code>  • <code>노원</code>\n"
+                f"   • <code>도봉</code>  • <code>성북</code>\n"
+                f"   • <code>강남</code>  • <code>서초</code>\n\n"
+                f"<i>입력하시면 자동으로 다음 단계(구역)로 넘어갑니다.</i>",
+                parse_mode="HTML",
                 reply_markup=kb_setup_region(),
             )
         elif data == "show_help":
@@ -5497,6 +5572,24 @@ def main():
             logger.info("✅ webhook registered: %s", webhook_url)
         except Exception as e:
             logger.exception("set_webhook failed: %s", e)
+
+        # 🆕 v6.0: 시작 시 chat_allowed_users 테이블 존재 확인 (큰 경고)
+        global _chat_allowed_users_table_exists
+        try:
+            await sb_get("chat_allowed_users?select=chat_id&limit=1")
+            _chat_allowed_users_table_exists = True
+            logger.info("✅ chat_allowed_users 테이블 정상 — 화이트리스트 활성")
+        except Exception as e:
+            msg = str(e).lower()
+            if 'does not exist' in msg or 'relation' in msg or 'pgrst205' in msg or '404' in msg:
+                _chat_allowed_users_table_exists = False
+                logger.error("=" * 70)
+                logger.error("🚨 [화이트리스트 비활성] chat_allowed_users 테이블이 DB 에 없습니다!")
+                logger.error("🚨 특별관리 대책방의 권한 체크가 작동하지 않습니다.")
+                logger.error("🚨 yago_patch_v58_to_v60.sql 또는 yago_master_v60.sql 을 즉시 적용하세요.")
+                logger.error("=" * 70)
+            else:
+                logger.warning("chat_allowed_users 테이블 확인 실패 (일시적): %s", e)
 
         runner = web.AppRunner(http_app)
         await runner.setup()
