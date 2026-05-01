@@ -624,20 +624,24 @@ if not MINIAPP_URL:
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "https://boys072659-gif.github.io/absentee-dashboard/").strip()
 
 
-def kb_reply_main(is_private: bool = True) -> ReplyKeyboardMarkup:
+def kb_reply_main(is_private: bool = True, is_special: bool = False) -> ReplyKeyboardMarkup:
     """하단에 고정되는 리플라이 키보드. 키보드 아이콘(⌨️) 탭하면 이 버튼들이 나옴.
     
     ⚠️ 웹앱 버튼은 1:1 개인 채팅에서만 작동. 그룹에서는 제외.
     🆕 1:1 개인방에선 '특별관리결석자' 버튼 숨김 (그룹방 전용 기능)
+    🆕 v6.0: 특별관리 대책방에선 '결석자 심방' 메뉴 숨김 (해당 대상자만 관리)
     """
-    if is_private:
-        # 🆕 개인방: 결석자 심방만
+    if is_special:
+        # 🆕 v6.0: 특별관리 대책방 — 특별관리결석자 메뉴만 노출
+        rows = [[KeyboardButton("🚨 특별관리결석자")]]
+    elif is_private:
+        # 개인방: 결석자 심방만
         rows = [[KeyboardButton("📋 결석자 심방")]]
     else:
-        # 그룹방: 결석자 심방 + 특별관리결석자
+        # 일반 그룹방: 결석자 심방 + 특별관리결석자
         rows = [[KeyboardButton("📋 결석자 심방"), KeyboardButton("🚨 특별관리결석자")]]
     # 웹앱 버튼은 개인 채팅에서만 추가 (그룹에서는 "Web app buttons can be used in private chats only" 에러 발생)
-    if is_private and MINIAPP_URL.startswith("https://"):
+    if is_private and not is_special and MINIAPP_URL.startswith("https://"):
         rows.append([KeyboardButton(
             "📝 결석자 심방 기록 (폼)",
             web_app=WebAppInfo(url=MINIAPP_URL)
@@ -651,28 +655,32 @@ def kb_reply_main(is_private: bool = True) -> ReplyKeyboardMarkup:
     )
 
 
-def kb_main_menu(is_private: bool = True) -> InlineKeyboardMarkup:
+def kb_main_menu(is_private: bool = True, is_special: bool = False) -> InlineKeyboardMarkup:
     """인라인 메인 메뉴. 웹앱 버튼은 개인 채팅에서만.
     🆕 1:1 개인방에선 '특별관리결석자' 메뉴 숨김 (그룹방 전용 기능)
+    🆕 v6.0: 특별관리 대책방에선 '결석자 심방' 메뉴 숨김
     """
-    rows = [
-        [InlineKeyboardButton("📋 결석자 심방",       callback_data="m:absentee")],
-    ]
-    # 🆕 특별관리는 그룹방에서만 노출
-    if not is_private:
-        rows.append([InlineKeyboardButton("🚨 특별관리결석자",    callback_data="m:special")])
-    # 웹앱 버튼은 개인 채팅에서만
-    if is_private and MINIAPP_URL.startswith("https://"):
-        rows.append([InlineKeyboardButton(
-            "📝 결석자 심방 기록 (미니웹앱)",
-            web_app=WebAppInfo(url=MINIAPP_URL)
-        )])
-    # 🆕 v5.8: 개인방엔 웹 대시보드 버튼 자동 추가
-    if is_private and DASHBOARD_URL:
-        rows.append([InlineKeyboardButton(
-            "📊 웹 대시보드 열기",
-            url=DASHBOARD_URL,
-        )])
+    rows = []
+    if is_special:
+        # 🆕 v6.0: 특별관리 대책방 — 특별관리결석자 메뉴만 노출
+        rows.append([InlineKeyboardButton("🚨 특별관리결석자", callback_data="m:special")])
+    else:
+        rows.append([InlineKeyboardButton("📋 결석자 심방", callback_data="m:absentee")])
+        # 특별관리는 그룹방에서만 노출
+        if not is_private:
+            rows.append([InlineKeyboardButton("🚨 특별관리결석자", callback_data="m:special")])
+        # 웹앱 버튼은 개인 채팅에서만
+        if is_private and MINIAPP_URL.startswith("https://"):
+            rows.append([InlineKeyboardButton(
+                "📝 결석자 심방 기록 (미니웹앱)",
+                web_app=WebAppInfo(url=MINIAPP_URL)
+            )])
+        # 개인방엔 웹 대시보드 버튼 자동 추가
+        if is_private and DASHBOARD_URL:
+            rows.append([InlineKeyboardButton(
+                "📊 웹 대시보드 열기",
+                url=DASHBOARD_URL,
+            )])
     rows += [
         [InlineKeyboardButton("📘 사용법 (도움말)",    callback_data="m:help")],
         [InlineKeyboardButton("🔍 DB 진단",            callback_data="m:diagnose")],
@@ -1798,7 +1806,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
             f"⌨️ 하단 키보드로 시작하세요 👇",
             parse_mode="Markdown",
-            reply_markup=kb_reply_main(is_private_chat(update)),
+            reply_markup=kb_reply_main(is_private_chat(update), is_special=is_sp_chat),
         )
 
     # 🛡 보안 체크 (개인방·그룹방 모두) — 승인되지 않으면 안내
@@ -1920,7 +1928,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 특별관리 대책방 — 인라인 메뉴만 + 하단 키보드 제거
         await update.message.reply_text(
             txt, parse_mode="Markdown",
-            reply_markup=kb_main_menu(is_private_chat(update)),
+            reply_markup=kb_main_menu(is_private_chat(update), is_special=True),
         )
         await update.message.reply_text(
             "🛡 <i>이 방은 하단 키보드 비활성 — 메뉴는 위 버튼 또는 명령어 사용</i>",
@@ -2081,6 +2089,16 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "m:home":
             await _show_home(update)
         elif data == "m:absentee":
+            # 🆕 v6.0: 특별관리 대책방에서는 결석자 심방 메뉴 차단
+            if await is_special_monitor_chat(chat_id):
+                await q.message.reply_text(
+                    "🛡 <b>이 방은 특별관리 대책방입니다</b>\n\n"
+                    "이 방에서는 <b>특별관리 대상자만</b> 관리할 수 있습니다.\n"
+                    "결석자 심방 기능은 <b>일반 그룹방 또는 개인 1:1</b> 에서 사용해주세요.\n\n"
+                    "👉 <b>🚨 특별관리결석자</b> 버튼을 사용하세요.",
+                    parse_mode="HTML",
+                )
+                return
             # 🔧 일반 결석자 심방 진입 시 이전 특별관리 컨텍스트 완전 제거
             await clear_tmp(chat_id)
             await _show_church_select(update, "abs")
@@ -2548,6 +2566,16 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pre_step = (ctx_pre.get("editing_step", "") if ctx_pre else "") or ""
     if not pre_step:
         if text == "📋 결석자 심방":
+            # 🆕 v6.0: 특별관리 대책방에서는 결석자 심방 메뉴 차단
+            if await is_special_monitor_chat(chat_id):
+                await update.message.reply_text(
+                    "🛡 <b>이 방은 특별관리 대책방입니다</b>\n\n"
+                    "이 방에서는 <b>특별관리 대상자만</b> 관리할 수 있습니다.\n"
+                    "결석자 심방 기능은 <b>일반 그룹방 또는 개인 1:1</b> 에서 사용해주세요.\n\n"
+                    "👉 <b>🚨 특별관리결석자</b> 버튼을 사용하세요.",
+                    parse_mode="HTML",
+                )
+                return
             # 🔧 이전 특별관리 컨텍스트 제거
             await clear_tmp(chat_id)
             await _show_church_menu(update, "abs")
