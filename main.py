@@ -703,6 +703,27 @@ def is_private_chat(update: Update) -> bool:
     except Exception:
         return True  # 알 수 없으면 안전하게 private으로
 
+
+# 🆕 v6.0: helper — chat_id 기반 자동 special 판단해 키보드 반환
+async def _kb_main(update: Update) -> InlineKeyboardMarkup:
+    """main 메뉴 인라인 키보드 — 특별관리 대책방이면 결석자 심방 메뉴 자동 숨김."""
+    is_sp = False
+    try:
+        is_sp = await is_special_monitor_chat(update.effective_chat.id)
+    except Exception:
+        pass
+    return kb_main_menu(is_private_chat(update), is_special=is_sp)
+
+
+async def _kb_reply(update: Update) -> ReplyKeyboardMarkup:
+    """reply 키보드 — 특별관리 대책방이면 결석자 심방 메뉴 자동 숨김."""
+    is_sp = False
+    try:
+        is_sp = await is_special_monitor_chat(update.effective_chat.id)
+    except Exception:
+        pass
+    return kb_reply_main(is_private_chat(update), is_special=is_sp)
+
 def kb_church_select(flow: str) -> InlineKeyboardMarkup:
     """flow: 'abs' | 'sp'"""
     rows = []
@@ -833,14 +854,14 @@ async def _send_help(update: Update):
     """도움말 전송 — HTML parse_mode (명령어 탭 복사 가능)"""
     try:
         await safe_reply_text(update.message, HELP_TEXT, parse_mode="HTML",
-                              reply_markup=kb_main_menu(is_private_chat(update)))
+                              reply_markup=await _kb_main(update))
     except Exception as e:
         logger.warning("help HTML 실패, 평문: %s", e)
         plain = (HELP_TEXT.replace("<b>","").replace("</b>","")
                           .replace("<i>","").replace("</i>","")
                           .replace("<code>","").replace("</code>",""))
         await safe_reply_text(update.message, plain,
-                              reply_markup=kb_main_menu(is_private_chat(update)))
+                              reply_markup=await _kb_main(update))
 
 
 async def safe_reply_text(message, text: str, **kwargs):
@@ -1661,7 +1682,7 @@ async def _on_scope_stop(update: Update, chat_id: int, stop_level: str):
     await q.message.reply_text(
         "🏠 *메인 메뉴*",
         parse_mode="Markdown",
-        reply_markup=kb_main_menu(is_private_chat(update)),
+        reply_markup=await _kb_main(update),
     )
 
 
@@ -1760,7 +1781,7 @@ async def _on_scope_text_input(update: Update, chat_id: int, text: str):
             f"💡 범위 변경(최초 설정자만): /setup\n"
             f"💡 현재 범위 확인: /myscope",
             parse_mode="HTML",
-            reply_markup=kb_main_menu(is_private_chat(update)),
+            reply_markup=await _kb_main(update),
         )
         return True
 
@@ -1900,7 +1921,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📌 *이 방의 담당 범위*: {md(scope_label(scope))}\n\n"
             f"🏠 *메인 메뉴*",
             parse_mode="Markdown",
-            reply_markup=kb_main_menu(is_private),
+            reply_markup=await _kb_main(update),
         )
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1936,9 +1957,9 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardRemove(),
         )
     else:
-        await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb_main_menu(is_private_chat(update)))
+        await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=await _kb_main(update))
         # 리플라이 키보드가 사라져있을 수 있으니 복구
-        await update.message.reply_text("⌨️ 하단 키보드 메뉴 활성화", reply_markup=kb_reply_main(is_private_chat(update)))
+        await update.message.reply_text("⌨️ 하단 키보드 메뉴 활성화", reply_markup=await _kb_reply(update))
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🆕 v6.0: 화이트리스트 체크
@@ -2024,7 +2045,7 @@ async def diagnose_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"   ✅ `{fn}` (존재)")
 
     await update.message.reply_text(
-        "\n".join(lines), parse_mode="Markdown", reply_markup=kb_main_menu(is_private_chat(update))
+        "\n".join(lines), parse_mode="Markdown", reply_markup=await _kb_main(update)
     )
 
 
@@ -2138,13 +2159,13 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # 사용법은 HTML parse_mode (명령어 탭 복사 지원)
             try:
                 await q.message.reply_text(HELP_TEXT, parse_mode="HTML",
-                                           reply_markup=kb_main_menu(is_private_chat(update)))
+                                           reply_markup=await _kb_main(update))
             except Exception as he:
                 logger.warning("help HTML 실패: %s", he)
                 plain = (HELP_TEXT.replace("<b>","").replace("</b>","")
                                   .replace("<i>","").replace("</i>","")
                                   .replace("<code>","").replace("</code>",""))
-                await q.message.reply_text(plain, reply_markup=kb_main_menu(is_private_chat(update)))
+                await q.message.reply_text(plain, reply_markup=await _kb_main(update))
         elif data == "m:diagnose":
             # 진단은 새 메시지로 전송 (긴 내용)
             class FakeUpd:
@@ -2182,7 +2203,7 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await clear_tmp(chat_id)
             await q.message.reply_text(
                 "🚫 입력이 취소되었습니다.",
-                reply_markup=kb_main_menu(is_private_chat(update)),
+                reply_markup=await _kb_main(update),
             )
 
         # ── 방 범위(scope) 설정 흐름 ──
@@ -2294,13 +2315,17 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _show_home(update: Update):
     q = update.callback_query
+    chat_id = update.effective_chat.id
+    is_sp_chat = await is_special_monitor_chat(chat_id)
     week_key, week_label = await get_active_week()
     txt = (
         "🏠 *메인 메뉴*\n\n"
         f"📅 현재 주차: *{md(week_label) if week_label else '미등록'}*\n"
         "원하는 기능을 선택하세요 👇"
     )
-    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb_main_menu(is_private_chat(update)))
+    if is_sp_chat:
+        txt += "\n\n🛡 _이 방은 특별관리 대책방 — 특별관리결석자 메뉴만 사용_"
+    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb_main_menu(is_private_chat(update), is_special=is_sp_chat))
 
 
 async def _show_church_select(update: Update, flow: str):
@@ -2367,7 +2392,7 @@ async def _scope_jump(update: Update, chat_id: int, scope: dict, flow: str):
     week_key, week_label = await get_active_week()
     if not week_key:
         await q.edit_message_text("❌ 등록된 주차가 없습니다.",
-                                  reply_markup=kb_main_menu(is_private_chat(update)))
+                                  reply_markup=await _kb_main(update))
         return
 
     church = scope.get("church")
@@ -2505,7 +2530,7 @@ async def _on_abs_dept(update: Update, chat_id: int, church: str, dept: str):
     if not week_key:
         await q.edit_message_text(
             "❌ 등록된 주차가 없습니다.\n웹 대시보드에서 명단을 먼저 업로드해주세요.",
-            reply_markup=kb_main_menu(is_private_chat(update)),
+            reply_markup=await _kb_main(update),
         )
         return
 
@@ -3356,7 +3381,7 @@ async def _on_sp_dept(update: Update, chat_id: int, church: str, dept: str):
     q = update.callback_query
     week_key, week_label = await get_active_week()
     if not week_key:
-        await q.edit_message_text("❌ 등록된 주차가 없습니다.", reply_markup=kb_main_menu(is_private_chat(update)))
+        await q.edit_message_text("❌ 등록된 주차가 없습니다.", reply_markup=await _kb_main(update))
         return
 
     targets = await fetch_absentees_4plus(week_key, church, dept)
@@ -3722,12 +3747,12 @@ async def _on_sp_unregister(update: Update, chat_id: int, church: str, dept: str
         await q.edit_message_text(
             f"🗑 <b>{_html.escape(str(name))}</b> 님을 특별관리에서 해제했습니다.",
             parse_mode="HTML",
-            reply_markup=kb_main_menu(is_private_chat(update)),
+            reply_markup=await _kb_main(update),
         )
     except Exception:
         await q.edit_message_text(
             f"🗑 {name} 님을 특별관리에서 해제했습니다.",
-            reply_markup=kb_main_menu(is_private_chat(update)),
+            reply_markup=await _kb_main(update),
         )
 
 
