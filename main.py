@@ -715,14 +715,21 @@ async def _kb_main(update: Update) -> InlineKeyboardMarkup:
     return kb_main_menu(is_private_chat(update), is_special=is_sp)
 
 
-async def _kb_reply(update: Update) -> ReplyKeyboardMarkup:
-    """reply 키보드 — 특별관리 대책방이면 결석자 심방 메뉴 자동 숨김."""
+async def _kb_reply(update: Update):
+    """reply 키보드 — 특별관리 대책방이면 결석자 심방 메뉴 자동 숨김.
+    🆕 v6.0: 그룹방에서는 ReplyKeyboard 자체를 안 보내고 ReplyKeyboardRemove 반환.
+    그룹방의 ReplyKeyboard 는 모든 멤버에게 동일하게 보여 권한 분리가 안 되므로,
+    인라인 키보드만 사용하도록 강제.
+    """
+    if not is_private_chat(update):
+        # 그룹방 — 키보드 강제 제거
+        return ReplyKeyboardRemove()
     is_sp = False
     try:
         is_sp = await is_special_monitor_chat(update.effective_chat.id)
     except Exception:
         pass
-    return kb_reply_main(is_private_chat(update), is_special=is_sp)
+    return kb_reply_main(True, is_special=is_sp)
 
 def kb_church_select(flow: str) -> InlineKeyboardMarkup:
     """flow: 'abs' | 'sp'"""
@@ -1820,14 +1827,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardRemove(),
         )
     else:
-        # 일반 그룹방·개인방 — 기존 하단 리플라이 키보드
+        # 일반 그룹방·개인방 — helper 가 자동으로 그룹방이면 KeyboardRemove 처리
         await update.message.reply_text(
             f"👋 *결석자 타겟 심방 봇*에 오신 것을 환영합니다\n"
             f"📅 현재 주차: *{md(week_label) if week_label else '미등록'}*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
             f"⌨️ 하단 키보드로 시작하세요 👇",
             parse_mode="Markdown",
-            reply_markup=kb_reply_main(is_private_chat(update), is_special=is_sp_chat),
+            reply_markup=await _kb_reply(update),
         )
 
     # 🛡 보안 체크 (개인방·그룹방 모두) — 승인되지 않으면 안내
