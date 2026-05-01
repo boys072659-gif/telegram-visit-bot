@@ -1771,16 +1771,35 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     chat_title = update.effective_chat.title or update.effective_chat.full_name or ""
     week_key, week_label = await get_active_week()
+    import html as _html
 
-    # 1) 하단에 고정되는 리플라이 키보드
-    await update.message.reply_text(
-        f"👋 *결석자 타겟 심방 봇*에 오신 것을 환영합니다\n"
-        f"📅 현재 주차: *{md(week_label) if week_label else '미등록'}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"⌨️ 하단 키보드로 시작하세요 👇",
-        parse_mode="Markdown",
-        reply_markup=kb_reply_main(is_private_chat(update)),
-    )
+    # 🆕 v6.0: 특별관리 대책방이면 하단 키보드를 명시적으로 제거
+    is_sp_chat = await is_special_monitor_chat(chat_id)
+
+    if is_sp_chat:
+        # 특별관리 대책방 — 하단 키보드 비활성화 + 인라인 메뉴 안내
+        await update.message.reply_text(
+            f"👋 <b>결석자 타겟 심방 봇</b>에 오신 것을 환영합니다\n"
+            f"📅 현재 주차: <b>{_html.escape(week_label) if week_label else '미등록'}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🛡 <i>이 방은 특별관리 대책방입니다 — 하단 키보드 비활성화</i>\n\n"
+            f"💡 <b>사용 방법</b>:\n"
+            f"• <code>시작</code> 또는 <code>/start</code> — 메인 메뉴\n"
+            f"• <code>메뉴</code> 또는 <code>/menu</code> — 인라인 메뉴\n"
+            f"• <code>도움말</code> 또는 <code>/help</code> — 사용법",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        # 일반 그룹방·개인방 — 기존 하단 리플라이 키보드
+        await update.message.reply_text(
+            f"👋 *결석자 타겟 심방 봇*에 오신 것을 환영합니다\n"
+            f"📅 현재 주차: *{md(week_label) if week_label else '미등록'}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"⌨️ 하단 키보드로 시작하세요 👇",
+            parse_mode="Markdown",
+            reply_markup=kb_reply_main(is_private_chat(update)),
+        )
 
     # 🛡 보안 체크 (개인방·그룹방 모두) — 승인되지 않으면 안내
     is_private = is_private_chat(update)
@@ -1886,15 +1905,32 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning("ensure_user_allowed_in_special_chat (menu): %s", _e)
 
     week_key, week_label = await get_active_week()
+    chat_id = update.effective_chat.id
+
+    # 🆕 v6.0: 특별관리 대책방인지 확인
+    is_sp_chat = await is_special_monitor_chat(chat_id)
+
     txt = (
         "🏠 *메인 메뉴*\n\n"
         f"📅 현재 주차: *{md(week_label) if week_label else '미등록'}*\n"
         "아래 버튼에서 원하는 기능을 선택하세요 👇\n\n"
         "💡 사용법은 *📘 사용법* 버튼 또는 `/help`"
     )
-    await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb_main_menu(is_private_chat(update)))
-    # 리플라이 키보드가 사라져있을 수 있으니 복구
-    await update.message.reply_text("⌨️ 하단 키보드 메뉴 활성화", reply_markup=kb_reply_main(is_private_chat(update)))
+    if is_sp_chat:
+        # 특별관리 대책방 — 인라인 메뉴만 + 하단 키보드 제거
+        await update.message.reply_text(
+            txt, parse_mode="Markdown",
+            reply_markup=kb_main_menu(is_private_chat(update)),
+        )
+        await update.message.reply_text(
+            "🛡 <i>이 방은 하단 키보드 비활성 — 메뉴는 위 버튼 또는 명령어 사용</i>",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb_main_menu(is_private_chat(update)))
+        # 리플라이 키보드가 사라져있을 수 있으니 복구
+        await update.message.reply_text("⌨️ 하단 키보드 메뉴 활성화", reply_markup=kb_reply_main(is_private_chat(update)))
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🆕 v6.0: 화이트리스트 체크
