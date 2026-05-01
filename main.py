@@ -3871,9 +3871,9 @@ async def wednesday_visit_plan_request_job(context: ContextTypes.DEFAULT_TYPE, s
                     )
 
                 # 5) 전송 (HTML → fallback to plain)
-                kb_link = kb_dashboard_link()  # 🆕 v4.7: 대시보드 버튼
+                # 🆕 v6.0: 사용자 요청 — 수요일 알람에는 대시보드 링크 표시 안 함
                 try:
-                    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML", reply_markup=kb_link)
+                    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
                     sent += 1
                 except Exception as e1:
                     logger.warning("HTML send 실패 chat_id=%s: %s", chat_id, e1)
@@ -3882,7 +3882,7 @@ async def wednesday_visit_plan_request_job(context: ContextTypes.DEFAULT_TYPE, s
                         plain = (msg.replace("<b>", "").replace("</b>", "")
                                    .replace("<i>", "").replace("</i>", "")
                                    .replace("<code>", "").replace("</code>", ""))
-                        await context.bot.send_message(chat_id=chat_id, text=plain, reply_markup=kb_link)
+                        await context.bot.send_message(chat_id=chat_id, text=plain)
                         sent += 1
                     except Exception as e2:
                         logger.warning("평문 send 실패 chat_id=%s: %s", chat_id, e2)
