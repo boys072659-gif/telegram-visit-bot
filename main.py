@@ -1221,6 +1221,34 @@ async def ensure_user_allowed_in_special_chat(update: Update) -> tuple[bool, boo
     if is_allowed:
         return True, False
 
+    # 🆕 v6.0: 텔레그램 그룹 자체의 owner/administrator 도 자동 허용
+    #   (소유자/관리자가 명시적으로 /allow 안 받아도 봇 사용 가능)
+    try:
+        from telegram import Bot
+        bot: Bot = update.get_bot()
+        member = await bot.get_chat_member(chat_id, user_id)
+        if member and member.status in ("creator", "administrator"):
+            # 자동으로 화이트리스트에도 추가 (다음부터는 캐시 hit)
+            user_display = user.full_name or user.username or f"user_{user_id}"
+            try:
+                await add_chat_allowed_user(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    user_name=user_display,
+                    is_owner=(member.status == "creator"),
+                    added_by=user_id,
+                )
+                logger.info(
+                    "👑 [텔레그램 관리자 자동 허용] chat=%s user=%s(%s) status=%s",
+                    chat_id, user_id, user_display, member.status,
+                )
+            except Exception as _e:
+                logger.warning("텔레그램 관리자 자동 등록 실패: %s", _e)
+            return True, False
+    except Exception as e:
+        # API 실패 — 안전하게 통과시키지 않음, 일반 화이트리스트 흐름으로
+        logger.debug("get_chat_member 실패: %s", e)
+
     # 등록 안됨 → 1회만 안내
     key = (chat_id, user_id)
     if key not in _unallowed_notified:
