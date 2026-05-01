@@ -3433,6 +3433,28 @@ async def _on_sp_pick(update: Update, chat_id: int, church: str, dept: str, name
         await q.message.reply_text(f"❌ 등록 실패: {e}")
         return
 
+    # 🆕 v6.0: 등록자를 이 방의 owner 로 자동 등록
+    #   목적 — 다른 사람이 이 방에서 먼저 봇 메시지를 보내도 권한이 안 옮겨감
+    #   등록자(update.effective_user)가 변은지 → 변은지가 owner 로 즉시 등록됨
+    try:
+        registrant = update.effective_user
+        if registrant and _chat_allowed_users_table_exists:
+            registrant_name = registrant.full_name or registrant.username or f"user_{registrant.id}"
+            await sb_rpc("upsert_chat_allowed_user", {
+                "p_chat_id":   chat.id,
+                "p_user_id":   registrant.id,
+                "p_user_name": registrant_name,
+                "p_is_owner":  True,
+                "p_added_by":  registrant.id,
+            })
+            logger.info(
+                "👑 [특별관리 owner 자동등록] chat=%s user=%s(%s) name=%s",
+                chat.id, registrant.id, registrant_name, name
+            )
+    except Exception as e:
+        # owner 자동 등록 실패는 등록 자체를 막지 않음 (관리자 페이지에서 수동 변경 가능)
+        logger.warning("특별관리 owner 자동등록 실패 chat=%s: %s", chat.id, e)
+
     if is_same:
         # 재진입
         await save_ctx(chat_id, tmp_sp_name=name, tmp_sp_phone=phone)
