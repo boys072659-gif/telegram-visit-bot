@@ -683,7 +683,6 @@ def kb_main_menu(is_private: bool = True, is_special: bool = False) -> InlineKey
             )])
     rows += [
         [InlineKeyboardButton("📘 사용법 (도움말)",    callback_data="m:help")],
-        [InlineKeyboardButton("🔍 DB 진단",            callback_data="m:diagnose")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -827,7 +826,6 @@ HELP_TEXT = (
     "• <code>/chatid</code> — 이 방의 Chat ID 확인\n"
     "• <code>/cancel</code> — 현재 입력 중단\n"
     "• <code>/help</code> — 이 사용법\n"
-    "• <code>/diagnose</code> — DB 진단\n"
     "• <code>/approve &lt;chat_id&gt;</code> — 방 승인 (관리자 전용)\n"
     "• <code>/deny &lt;chat_id&gt;</code> — 방 거부 (관리자 전용)\n"
     "• <code>/allowed</code> — (특별관리 대책방) 봇 사용자 목록\n"
@@ -857,16 +855,69 @@ HELP_TEXT = (
 HELP_TEXT_1 = HELP_TEXT
 HELP_TEXT_2 = ""
 
+# 🆕 v6.0: 특별관리 대책방 전용 사용법 (1, 3, 7, 8 → 1, 2, 3, 4)
+HELP_TEXT_SP = (
+    "📖 <b>특별관리 대책방 사용법</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    "<b>📘 1️⃣ 방 설정 (최초 1회)</b>\n"
+    "<code>/start</code> 또는 <code>/setup</code> 으로 이 방의 담당 범위 설정:\n"
+    "   교회 → 부서 → 지역 (필수) → 구역 (선택)\n"
+    "⚠️ 지역까지 필수 — 개인정보 보호\n"
+    "설정 후 🚨 특별관리결석자 에서 해당 범위의 대상자만 표시\n\n"
+
+    "<b>🚨 2️⃣ 특별관리 결석자 (연속결석 4회 이상)</b>\n"
+    "메인 메뉴 → 🚨 특별관리결석자 탭\n"
+    "→ 교회 → 부서 → 결석자 선택\n"
+    "→ 이 방이 <b>이 한 사람 전용 피드백방</b> 으로 등록\n"
+    "<b>⚠️ 그룹방당 1명만 등록 가능</b>\n"
+    "→ 4항목 체크리스트 표시:\n"
+    "   ① 대책방 초대완료 (최초 1회)\n"
+    "   ② 금주 피드백 진행 (주간 리셋)\n"
+    "   ③ 금주 심방예정일\n"
+    "   ④ 금주 심방계획\n"
+    "매주 수요일 08:00 KST 미체크 항목 리마인더 자동 발송\n\n"
+
+    "<b>⌨️ 3️⃣ 명령어 모음</b> <i>(탭하면 복사)</i>\n"
+    "• <code>/start</code> — 방 설정 + 메인 메뉴\n"
+    "• <code>/menu</code> — 메인 메뉴\n"
+    "• <code>/setup</code> — 방 범위 재설정 (최초 설정자만)\n"
+    "• <code>/myscope</code> — 이 방의 현재 범위 확인\n"
+    "• <code>/chatid</code> — 이 방의 Chat ID 확인\n"
+    "• <code>/cancel</code> — 현재 입력 중단\n"
+    "• <code>/help</code> — 이 사용법\n"
+    "• <code>/allowed</code> — 봇 사용자 목록\n"
+    "• <code>/allow</code> — 봇 사용자 추가 (reply 필요)\n"
+    "• <code>/disallow</code> — 봇 사용자 제거 (reply 필요)\n\n"
+
+    "<b>🛡 4️⃣ 특별관리 대책방 사용자 제한</b>\n"
+    "특별관리 대책방은 <b>지정된 분만</b> 봇 사용 가능:\n"
+    "• 첫 봇 사용자 → 자동으로 <b>owner(👑)</b> 등록\n"
+    "• owner 가 다른 분을 추가하는 방법:\n"
+    "   ① 답장 방식: 추가할 분이 <b>이 그룹방에서</b> 텔레그램 메시지를 보내야 함\n"
+    "      → 그 분 메시지에 <b>답장(reply)</b> + <code>/allow</code>\n"
+    "   ② 직접 입력: <code>/allow [user_id] [이름]</code>\n"
+    "• 등록 안 된 분이 명령 보내면 1회 안내 후 무시\n"
+)
+
 async def _send_help(update: Update):
-    """도움말 전송 — HTML parse_mode (명령어 탭 복사 가능)"""
+    """도움말 전송 — HTML parse_mode (명령어 탭 복사 가능)
+    🆕 v6.0: 특별관리 대책방이면 압축 버전 (1·3·7·8 → 1·2·3·4)
+    """
+    is_sp = False
     try:
-        await safe_reply_text(update.message, HELP_TEXT, parse_mode="HTML",
+        is_sp = await is_special_monitor_chat(update.effective_chat.id)
+    except Exception:
+        pass
+    text = HELP_TEXT_SP if is_sp else HELP_TEXT
+    try:
+        await safe_reply_text(update.message, text, parse_mode="HTML",
                               reply_markup=await _kb_main(update))
     except Exception as e:
         logger.warning("help HTML 실패, 평문: %s", e)
-        plain = (HELP_TEXT.replace("<b>","").replace("</b>","")
-                          .replace("<i>","").replace("</i>","")
-                          .replace("<code>","").replace("</code>",""))
+        plain = (text.replace("<b>","").replace("</b>","")
+                     .replace("<i>","").replace("</i>","")
+                     .replace("<code>","").replace("</code>",""))
         await safe_reply_text(update.message, plain,
                               reply_markup=await _kb_main(update))
 
@@ -1818,7 +1869,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👋 <b>결석자 타겟 심방 봇</b>에 오신 것을 환영합니다\n"
             f"📅 현재 주차: <b>{_html.escape(week_label) if week_label else '미등록'}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🛡 <i>이 방은 특별관리 대책방입니다 — 하단 키보드 비활성화</i>\n\n"
             f"💡 <b>사용 방법</b>:\n"
             f"• <code>시작</code> 또는 <code>/start</code> — 메인 메뉴\n"
             f"• <code>메뉴</code> 또는 <code>/menu</code> — 인라인 메뉴\n"
@@ -1953,16 +2003,17 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💡 사용법은 *📘 사용법* 버튼 또는 `/help`"
     )
     if is_sp_chat:
-        # 특별관리 대책방 — 인라인 메뉴만 + 하단 키보드 제거
+        # 특별관리 대책방 — 인라인 메뉴만 (하단 키보드는 인라인 메시지에 함께 제거)
         await update.message.reply_text(
             txt, parse_mode="Markdown",
             reply_markup=kb_main_menu(is_private_chat(update), is_special=True),
         )
-        await update.message.reply_text(
-            "🛡 <i>이 방은 하단 키보드 비활성 — 메뉴는 위 버튼 또는 명령어 사용</i>",
-            parse_mode="HTML",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+        # 키보드 제거 (안내 문구 없이 조용히)
+        try:
+            kb_remove_msg = await update.message.reply_text(".", reply_markup=ReplyKeyboardRemove())
+            await kb_remove_msg.delete()
+        except Exception:
+            pass
     else:
         await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=await _kb_main(update))
         # 리플라이 키보드가 사라져있을 수 있으니 복구
@@ -2163,13 +2214,14 @@ async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await _show_church_select(update, "sp")
         elif data == "m:help":
-            # 사용법은 HTML parse_mode (명령어 탭 복사 지원)
+            # 🆕 v6.0: 특별관리 대책방이면 압축 사용법
+            help_text = HELP_TEXT_SP if await is_special_monitor_chat(chat_id) else HELP_TEXT
             try:
-                await q.message.reply_text(HELP_TEXT, parse_mode="HTML",
+                await q.message.reply_text(help_text, parse_mode="HTML",
                                            reply_markup=await _kb_main(update))
             except Exception as he:
                 logger.warning("help HTML 실패: %s", he)
-                plain = (HELP_TEXT.replace("<b>","").replace("</b>","")
+                plain = (help_text.replace("<b>","").replace("</b>","")
                                   .replace("<i>","").replace("</i>","")
                                   .replace("<code>","").replace("</code>",""))
                 await q.message.reply_text(plain, reply_markup=await _kb_main(update))
