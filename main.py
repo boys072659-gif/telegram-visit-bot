@@ -801,8 +801,10 @@ HELP_TEXT = (
     "<b>🛡 8️⃣ 특별관리 대책방 사용자 제한</b>\n"
     "특별관리 대책방은 <b>지정된 분만</b> 봇 사용 가능:\n"
     "• 첫 봇 사용자 → 자동으로 <b>owner(👑)</b> 등록\n"
-    "• owner 가 다른 분을 추가하려면:\n"
-    "  추가할 분의 메시지에 <b>답장(reply)</b> + <code>/allow</code>\n"
+    "• owner 가 다른 분을 추가하는 방법:\n"
+    "   ① 답장 방식: 추가할 분이 <b>이 그룹방에서</b> 텔레그램 메시지를 보내야 함\n"
+    "      → 그 분 메시지에 <b>답장(reply)</b> + <code>/allow</code>\n"
+    "   ② 직접 입력: <code>/allow [user_id] [이름]</code>\n"
     "• 등록 안 된 분이 명령 보내면 1회 안내 후 무시\n\n"
 
     "━━━━━━━━━━━━━━━━━━━━\n"
@@ -4066,11 +4068,49 @@ async def allow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # reply 대상 추출
     reply_msg = update.message.reply_to_message
     if not reply_msg or not reply_msg.from_user:
+        # 🆕 v6.0: text 인자로 user_id 직접 받기
+        #   사용법: /allow 123456789  또는  /allow 123456789 박정호
+        args = (update.message.text or '').split()[1:]
+        if args and args[0].isdigit():
+            target_uid = int(args[0])
+            target_name = ' '.join(args[1:]) if len(args) > 1 else f'user_{target_uid}'
+            try:
+                await sb_rpc("upsert_chat_allowed_user", {
+                    "p_chat_id": chat_id,
+                    "p_user_id": target_uid,
+                    "p_user_name": target_name,
+                    "p_is_owner": False,
+                    "p_added_by": user.id,
+                })
+                await update.message.reply_text(
+                    f"✅ <b>{_html.escape(target_name)}</b> 님 (user_id: <code>{target_uid}</code>) 을\n"
+                    f"이 방의 봇 사용자로 추가했습니다.\n\n"
+                    f"이제 그 분이 이 방에서 봇 명령을 사용할 수 있습니다.",
+                    parse_mode="HTML",
+                )
+                return
+            except Exception as e:
+                logger.exception("allow by user_id failed: %s", e)
+                await update.message.reply_text(
+                    f"❌ 추가 실패: {_html.escape(str(e))}",
+                    parse_mode="HTML",
+                )
+                return
+
         await update.message.reply_text(
-            "ℹ️ <b>사용법</b>\n\n"
-            "1️⃣ 추가할 분의 메시지에 <b>답장(reply)</b>하면서\n"
-            "2️⃣ <code>/allow</code> 라고 입력하세요.\n\n"
-            "그러면 그 분이 이 방의 봇을 사용할 수 있게 됩니다.\n\n"
+            "ℹ️ <b>사용법 (두 가지 방법)</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>방법 1.</b> 답장으로 추가 (권장)\n"
+            "1️⃣ 추가할 분이 <b>이 그룹방에서</b> 메시지를 한 번 보내야 합니다.\n"
+            "   <i>(외부 카톡·문자 스크린샷은 안 됩니다 — 텔레그램이 user_id 를 모름)</i>\n"
+            "2️⃣ 그 분의 텔레그램 메시지를 길게 누름 → <b>답장(Reply)</b>\n"
+            "3️⃣ <code>/allow</code> 입력\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>방법 2.</b> user_id 로 직접 추가\n"
+            "<code>/allow [user_id]</code> 또는 <code>/allow [user_id] [이름]</code>\n"
+            "예: <code>/allow 123456789 박정호</code>\n"
+            "<i>(user_id 는 그 분이 봇과 1대1 대화 한 번 후 확인 가능)</i>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
             "<i>현재 등록된 사용자: <code>/allowed</code></i>",
             parse_mode="HTML",
         )
