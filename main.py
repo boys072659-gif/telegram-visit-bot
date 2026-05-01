@@ -2489,6 +2489,22 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as _e:
         logger.warning("ensure_user_allowed_in_special_chat (text): %s", _e)
 
+    # 🆕 v6.0: 한국어/일반 텍스트 → 명령어 매핑
+    #   사용자가 "시작", "메뉴" 등을 그냥 입력해도 명령처럼 작동하게
+    text_low = text.lower()
+    if text in ("시작", "처음", "Start", "start") or text_low == "/start":
+        await start_command(update, context)
+        return
+    if text in ("메뉴", "menu", "Menu") or text_low == "/menu":
+        await menu_command(update, context)
+        return
+    if text in ("도움말", "사용법", "도움", "help", "Help") or text_low == "/help":
+        await help_command(update, context)
+        return
+    if text in ("취소", "Cancel", "cancel") or text_low == "/cancel":
+        await cancel_command(update, context)
+        return
+
     # ── 0) 리플라이 키보드 (하단 버튼) 라벨 라우팅 ──────────────────────
     #  - 컨텍스트보다 우선하지만, 사용자가 입력 중이면 의도와 다를 수 있으니
     #    컨텍스트의 editing_step 이 비어있을 때만 라우팅
