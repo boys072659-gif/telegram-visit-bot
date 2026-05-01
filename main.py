@@ -4216,7 +4216,7 @@ async def disallow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def allowed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """🆕 이 방의 화이트리스트 사용자 목록 표시."""
+    """🆕 이 방의 화이트리스트 사용자 목록 표시 (user_id 포함, 비활성도 표시)."""
     import html as _html
     chat = update.effective_chat
     if not chat:
@@ -4238,26 +4238,63 @@ async def allowed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    rows = await list_chat_allowed_users(chat_id)
-    if not rows:
+    # 🆕 v6.0: 활성 + 비활성 모두 가져오기 (user_id 보여주기 위함)
+    try:
+        all_rows = await sb_get(
+            f"chat_allowed_users?select=user_id,user_name,is_owner,is_active,added_at"
+            f"&chat_id=eq.{chat_id}&order=is_active.desc,is_owner.desc,added_at.asc"
+        ) or []
+    except Exception as e:
+        logger.warning("list all users 실패: %s", e)
+        all_rows = []
+
+    if not all_rows:
         await update.message.reply_text(
-            "📋 등록된 봇 사용자가 없습니다.\n"
-            "<i>(첫 명령 사용자가 자동으로 owner 로 등록됩니다.)</i>",
+            "📋 이 방에서 봇과 상호작용한 사람이 아직 없습니다.\n\n"
+            "💡 <b>tip</b>: 추가하려는 분이 이 그룹방에서 메시지를 한 번 보내면\n"
+            "이 목록에 나타나며, 답장 + <code>/allow</code> 또는\n"
+            "<code>/allow [user_id]</code> 로 추가할 수 있습니다.",
             parse_mode="HTML",
         )
         return
 
-    lines = ["🛡 <b>이 방의 봇 사용자</b>"]
+    lines = ["🛡 <b>이 방에서 봇과 상호작용한 사람들</b>"]
     lines.append("━" * 14)
-    for r in rows:
-        name = _html.escape(r.get("user_name") or f"user_{r.get('user_id')}")
-        crown = "👑 " if r.get("is_owner") else "   "
-        lines.append(f"{crown}{name}")
+
+    active_rows = [r for r in all_rows if r.get('is_active')]
+    inactive_rows = [r for r in all_rows if not r.get('is_active')]
+
+    if active_rows:
+        lines.append("✅ <b>활성 (봇 사용 가능)</b>")
+        for r in active_rows:
+            name = _html.escape(r.get("user_name") or f"user_{r.get('user_id')}")
+            crown = "👑" if r.get("is_owner") else "  "
+            uid = r.get('user_id')
+            lines.append(f"{crown} {name}  <code>{uid}</code>")
+
+    if inactive_rows:
+        lines.append("")
+        lines.append("⚪ <b>비활성 (한때 등록됐던 사람들 — 다시 추가 가능)</b>")
+        for r in inactive_rows:
+            name = _html.escape(r.get("user_name") or f"user_{r.get('user_id')}")
+            uid = r.get('user_id')
+            lines.append(f"   {name}  <code>{uid}</code>")
+
     lines.append("")
     lines.append("<i>👑 = owner (다른 사용자 추가/제거 가능)</i>")
-    lines.append("<i>추가: 추가할 분 메시지에 답장 + <code>/allow</code></i>")
+    lines.append("<i>숫자 = user_id (탭하면 복사됨)</i>")
+    lines.append("")
+    lines.append("<b>💡 사용자 추가 방법:</b>")
+    lines.append("• 답장 방식: 추가할 분 메시지에 답장 + <code>/allow</code>")
+    lines.append("• ID 방식: <code>/allow [user_id] [이름]</code>")
     lines.append("<i>제거: 제거할 분 메시지에 답장 + <code>/disallow</code></i>")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def members_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🆕 v6.0: /members — /allowed 별칭. 그룹방의 사용자 목록 + user_id"""
+    await allowed_command(update, context)
+
 
 
 async def prereq_church_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4946,6 +4983,7 @@ def main():
     app.add_handler(CommandHandler("allow",    allow_command))
     app.add_handler(CommandHandler("disallow", disallow_command))
     app.add_handler(CommandHandler("allowed",  allowed_command))
+    app.add_handler(CommandHandler("members",  members_command))
 
     app.add_handler(CallbackQueryHandler(button_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
