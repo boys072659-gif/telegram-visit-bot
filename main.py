@@ -297,21 +297,10 @@ async def resolve_real_name(
 
 async def enrich_names(rows: list, church_key: str = "church", dept_key: str = "dept",
                        name_key: str = "name", phone_key: str = "phone_last4") -> list:
-    """결석자 행 목록을 받아서 각 행의 name을 실제 이름으로 복구."""
-    if not rows: return rows
-    for r in rows:
-        nm = r.get(name_key, "")
-        if _is_masked_name(nm):
-            real = await resolve_real_name(
-                nm,
-                church=r.get(church_key),
-                dept=r.get(dept_key),
-                phone_last4=r.get(phone_key),
-            )
-            if real and real != nm:
-                r[name_key] = real
-                r["_original_name"] = nm  # 원본 보존
-    return rows
+    """결석자 행 목록을 받아서 각 행의 name을 실제 이름으로 복구.
+    🆕 v6.0: 사용자 요청 — 마스킹된 이름(김*희)을 그대로 표시 (개인정보 보호)
+    """
+    return rows or []
 
 
 # ═════════════════════════════════════════════════════════════════════════════
