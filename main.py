@@ -1211,29 +1211,48 @@ async def ensure_user_allowed_in_special_chat(update: Update) -> tuple[bool, boo
         return True, False
 
     # 🆕 v6.0: 텔레그램 그룹 자체의 owner/administrator 도 자동 허용
-    #   (소유자/관리자가 명시적으로 /allow 안 받아도 봇 사용 가능)
+    #   ⚠️ 단, 청년회 부서는 제외 — owner가 명시적으로 /allow 한 사람만 사용 가능
+    #   (청년회는 사용자 명단이 자주 바뀌어 관리자만 통제 필요)
     try:
-        from telegram import Bot
-        bot: Bot = update.get_bot()
-        member = await bot.get_chat_member(chat_id, user_id)
-        if member and member.status in ("creator", "administrator"):
-            # 자동으로 화이트리스트에도 추가 (다음부터는 캐시 hit)
-            user_display = user.full_name or user.username or f"user_{user_id}"
-            try:
-                await add_chat_allowed_user(
-                    chat_id=chat_id,
-                    user_id=user_id,
-                    user_name=user_display,
-                    is_owner=(member.status == "creator"),
-                    added_by=user_id,
-                )
-                logger.info(
-                    "👑 [텔레그램 관리자 자동 허용] chat=%s user=%s(%s) status=%s",
-                    chat_id, user_id, user_display, member.status,
-                )
-            except Exception as _e:
-                logger.warning("텔레그램 관리자 자동 등록 실패: %s", _e)
-            return True, False
+        # 이 방의 특별관리 대상자 부서 조회
+        target_dept = ""
+        try:
+            sp_rows = await sb_get(
+                f"special_management_targets?select=dept&monitor_chat_id=eq.{chat_id}&limit=1"
+            )
+            if sp_rows:
+                target_dept = (sp_rows[0].get("dept") or "").strip()
+        except Exception:
+            pass
+
+        # 청년회는 자동 허용 스킵 — owner가 /allow 로 명시 등록한 사람만
+        if target_dept == "청년회":
+            logger.info(
+                "[화이트리스트] 청년회 그룹방 — 텔레그램 관리자 자동 허용 스킵 chat=%s user=%s",
+                chat_id, user_id
+            )
+        else:
+            from telegram import Bot
+            bot: Bot = update.get_bot()
+            member = await bot.get_chat_member(chat_id, user_id)
+            if member and member.status in ("creator", "administrator"):
+                # 자동으로 화이트리스트에도 추가 (다음부터는 캐시 hit)
+                user_display = user.full_name or user.username or f"user_{user_id}"
+                try:
+                    await add_chat_allowed_user(
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        user_name=user_display,
+                        is_owner=(member.status == "creator"),
+                        added_by=user_id,
+                    )
+                    logger.info(
+                        "👑 [텔레그램 관리자 자동 허용] chat=%s user=%s(%s) status=%s dept=%s",
+                        chat_id, user_id, user_display, member.status, target_dept,
+                    )
+                except Exception as _e:
+                    logger.warning("텔레그램 관리자 자동 등록 실패: %s", _e)
+                return True, False
     except Exception as e:
         # API 실패 — 안전하게 통과시키지 않음, 일반 화이트리스트 흐름으로
         logger.debug("get_chat_member 실패: %s", e)
