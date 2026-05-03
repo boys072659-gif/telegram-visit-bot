@@ -2654,8 +2654,26 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
 
-    # 🆕 v6.0: 특별관리 대책방 화이트리스트 체크
-    #   '📋 결석자 심방', '🚨 특별관리결석자' 등 텍스트 입력도 막아야 함
+    # 🆕 v6.0: 봇이 반응할 텍스트인지 먼저 판단
+    #   일반 대화에는 봇이 반응하지 않게 — 권한 체크 메시지조차 보내지 않음
+    text_low = text.lower()
+    BOT_KEYWORDS = (
+        "시작", "처음", "메뉴", "도움말", "사용법", "도움", "취소",
+        "Start", "start", "Menu", "menu", "Help", "help", "Cancel", "cancel",
+        "📋 결석자 심방", "🚨 특별관리결석자", "📘 사용법", "🏠 메인 메뉴",
+    )
+    is_bot_command = text.startswith("/") or text in BOT_KEYWORDS
+
+    # 컨텍스트 확인 — 입력 대기 중인지 (지역, 구역, 심방계획 등)
+    ctx_pre_early = await get_ctx(chat_id)
+    pre_step_early = (ctx_pre_early.get("editing_step", "") if ctx_pre_early else "")
+    is_awaiting_input = bool(pre_step_early)
+
+    # 봇 키워드도 아니고 입력 대기 중도 아니면 — 일반 대화로 간주, 봇이 반응 안 함
+    if not is_bot_command and not is_awaiting_input:
+        return
+
+    # 🆕 v6.0: 특별관리 대책방 화이트리스트 체크 (위 필터 통과한 경우에만)
     try:
         allowed, _ = await ensure_user_allowed_in_special_chat(update)
         if not allowed:
@@ -2664,8 +2682,6 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning("ensure_user_allowed_in_special_chat (text): %s", _e)
 
     # 🆕 v6.0: 한국어/일반 텍스트 → 명령어 매핑
-    #   사용자가 "시작", "메뉴" 등을 그냥 입력해도 명령처럼 작동하게
-    text_low = text.lower()
     if text in ("시작", "처음", "Start", "start") or text_low == "/start":
         await start_command(update, context)
         return
