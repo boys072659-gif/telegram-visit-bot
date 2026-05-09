@@ -5592,33 +5592,100 @@ def main():
         sent = 0
         failed = 0
         failures = []
+        migrated_count = 0   # 🆕 마이그레이션 자동 감지+재시도 카운트
+        deactivated_count = 0  # 🆕 비활성화된 그룹 카운트
+
         for r in target_chats:
             cid = r["chat_id"]
+            success = False
+            send_kwargs = {
+                "chat_id": cid,
+                "text": prefixed_message,
+                "parse_mode": "HTML",
+            }
+            if reply_markup is not None:
+                send_kwargs["reply_markup"] = reply_markup
+
             try:
-                send_kwargs = {
-                    "chat_id": cid,
-                    "text": prefixed_message,
-                    "parse_mode": "HTML",
-                }
-                if reply_markup is not None:
-                    send_kwargs["reply_markup"] = reply_markup
                 await app.bot.send_message(**send_kwargs)
+                success = True
                 sent += 1
-                await asyncio.sleep(0.05)  # rate limit 안전장치
             except Exception as e:
-                failed += 1
-                failures.append({
-                    "chat_id": cid,
-                    "title": r.get("chat_title"),
-                    "error": str(e)[:200],
-                })
-                logger.warning("broadcast 발송 실패 chat=%s err=%s", cid, e)
+                err_str = str(e)
+                # 🆕 v6.0: Group migrated to supergroup 자동 처리
+                #   에러 메시지 또는 e.message에서 새 chat_id 추출 → DB 업데이트 + 재시도
+                new_chat_id = None
+                # python-telegram-bot 의 ChatMigrated 예외에는 new_chat_id 속성이 있음
+                if hasattr(e, "new_chat_id") and e.new_chat_id:
+                    new_chat_id = e.new_chat_id
+                else:
+                    # 텍스트에서 'New chat id: -1003860104349' 추출
+                    import re as _re
+                    m = _re.search(r"New chat id:\s*(-?\d+)", err_str)
+                    if m:
+                        try: new_chat_id = int(m.group(1))
+                        except: pass
+
+                if new_chat_id:
+                    # DB 갱신 + 재시도
+                    try:
+                        # authorized_chats 테이블의 chat_id 업데이트
+                        await sb_patch(
+                            f"authorized_chats?chat_id=eq.{cid}",
+                            {"chat_id": new_chat_id},
+                        )
+                        logger.info("[broadcast] migrated %s → %s (DB 갱신)", cid, new_chat_id)
+                        migrated_count += 1
+                        # 새 chat_id로 즉시 재시도
+                        send_kwargs["chat_id"] = new_chat_id
+                        await app.bot.send_message(**send_kwargs)
+                        success = True
+                        sent += 1
+                    except Exception as e2:
+                        logger.warning("[broadcast] migrated 재발송 실패 %s → %s: %s", cid, new_chat_id, e2)
+                        failed += 1
+                        failures.append({
+                            "chat_id": cid,
+                            "title": r.get("chat_title"),
+                            "error": f"마이그레이션 재발송 실패: {str(e2)[:150]}",
+                        })
+                # 🆕 v6.0: Chat not found / Forbidden / chat was deleted → 비활성화
+                elif ("Chat not found" in err_str or
+                      "chat was deleted" in err_str or
+                      "kicked" in err_str.lower() or
+                      "Forbidden" in err_str):
+                    try:
+                        await sb_patch(
+                            f"authorized_chats?chat_id=eq.{cid}",
+                            {"is_active": False},
+                        )
+                        logger.info("[broadcast] 비활성화 chat=%s reason=%s", cid, err_str[:80])
+                        deactivated_count += 1
+                    except Exception as e3:
+                        logger.warning("[broadcast] 비활성화 실패 %s: %s", cid, e3)
+                    failed += 1
+                    failures.append({
+                        "chat_id": cid,
+                        "title": r.get("chat_title"),
+                        "error": str(e)[:200] + " (자동 비활성화됨)",
+                    })
+                else:
+                    failed += 1
+                    failures.append({
+                        "chat_id": cid,
+                        "title": r.get("chat_title"),
+                        "error": str(e)[:200],
+                    })
+                    logger.warning("broadcast 발송 실패 chat=%s err=%s", cid, e)
+            await asyncio.sleep(0.05)  # rate limit 안전장치
 
         return web.json_response({
             "ok": True,
             "total_targets": len(target_chats),
             "sent": sent,
             "failed": failed,
+            "migrated": migrated_count,       # 🆕 자동 마이그레이션 처리 건수
+            "deactivated": deactivated_count, # 🆕 자동 비활성화 건수
             "failures": failures[:20],
         })
 
