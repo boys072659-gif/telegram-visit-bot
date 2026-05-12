@@ -3937,61 +3937,98 @@ async def weekly_reminder_job(context: ContextTypes.DEFAULT_TYPE, source: str = 
 
     logger.info("🔔 weekly_reminder_job start (source=%s)", source)
     try:
-        targets = await sb_rpc("get_all_special_targets", {}) or []
-        if not targets:
+        # 🆕 v6.0: 순서 변경 — ① 먼저 지난 주 진행 상황을 보고용으로 가져오고
+        #                      ② 리셋 (item1=초대 유지, item2/3/4 만 리셋)
+        #                      ③ 새 주차 안내 메시지 발송
+        # 이렇게 해야 "방금 완료했는데 다시 미체크?" 같은 혼란이 없음.
+        targets_before = await sb_rpc("get_all_special_targets", {}) or []
+        if not targets_before:
             logger.info("no special targets, reset only")
             try: await sb_rpc("reset_special_weekly_items", {})
             except Exception: pass
             return
 
-        for t in targets:
+        # ① 지난 주 완료 상태 매핑 (chat_id → 완료 여부, 이름 등)
+        prev_status = {}
+        for t in targets_before:
             chat_id = t.get("monitor_chat_id")
             if not chat_id: continue
-            name   = t.get("name", "?")
-            dept   = t.get("dept", "")
-            region = t.get("region_name","") or ""
-            zone   = t.get("zone_name","") or ""
+            done_all = bool(
+                t.get("item2_feedback_done") and
+                (t.get("item3_visit_date") or "") and
+                (t.get("item4_visit_plan") or "")
+            )
+            prev_status[chat_id] = {
+                "name": t.get("name", "?"),
+                "dept": t.get("dept", ""),
+                "item1_invited": bool(t.get("item1_chat_invited")),
+                "item2_feedback": bool(t.get("item2_feedback_done")),
+                "item3_date": t.get("item3_visit_date") or "",
+                "item4_plan": t.get("item4_visit_plan") or "",
+                "all_done": done_all,
+            }
 
-            unchecked = []
-            if not t.get("item1_chat_invited"):
-                unchecked.append("⬜️ 1. 대책방 초대완료 (최초 1회)")
-            if not t.get("item2_feedback_done"):
-                unchecked.append("⬜️ 2. 금주 피드백 진행")
-            if not (t.get("item3_visit_date") or ""):
-                unchecked.append("⬜️ 3. 금주 심방예정일 (미입력)")
-            if not (t.get("item4_visit_plan") or ""):
-                unchecked.append("⬜️ 4. 금주 심방계획 (미입력)")
+        # ② 먼저 리셋 (item1 유지, item2/3/4 리셋)
+        try:
+            await sb_rpc("reset_special_weekly_items", {})
+            logger.info("weekly reset done (item2/3/4 reset, item1 preserved)")
+        except Exception as e:
+            logger.warning("weekly reset failed: %s", e)
 
-            if unchecked:
-                # 🆕 메시지 간소화 — 이름·부서·지역만
-                msg = (
-                    f"📋 *체크리스트 — 미진행 항목*\n"
-                    f"👤 *{md(name)}* ({md(dept)})\n\n"
-                    + "\n".join(unchecked) +
-                    f"\n\n_/menu → 🚨 특별관리결석자 에서 입력_"
-                )
-            else:
-                msg = (
-                    f"✅ *모든 항목 완료*\n"
-                    f"👤 {md(name)} ({md(dept)})\n\n"
-                    f"수고하셨습니다! _(2~4번은 곧 초기화됩니다)_"
-                )
+        # ③ 새 주차 안내 메시지 발송
+        sent = 0; failed = 0
+        for chat_id, prev in prev_status.items():
+            name = prev["name"]
+            dept = prev["dept"]
+            # 지난 주 진행 요약 (간단히)
+            last_week_summary = []
+            if prev["item2_feedback"]: last_week_summary.append("✅ 피드백")
+            if prev["item3_date"]:     last_week_summary.append(f"✅ 심방일({prev['item3_date']})")
+            if prev["item4_plan"]:     last_week_summary.append("✅ 심방계획")
+            last_week_txt = " · ".join(last_week_summary) if last_week_summary else "(미진행)"
+
+            # 초대 안 된 사람은 1번부터 다시 안내
+            invite_warn = ""
+            if not prev["item1_invited"]:
+                invite_warn = "\n⚠️ 1. *대책방 초대*가 아직 완료되지 않았습니다.\n"
+
+            msg = (
+                f"🔄 *새 주차 시작 — 특별관리 체크리스트 초기화*\n"
+                f"👤 *{md(name)}* ({md(dept)})\n\n"
+                f"📋 *지난 주 진행*: {md(last_week_txt)}"
+                f"{invite_warn}\n"
+                f"📌 *이번 주 진행할 항목*:\n"
+                f"⬜️ 2. 금주 피드백 진행\n"
+                f"⬜️ 3. 금주 심방예정일\n"
+                f"⬜️ 4. 금주 심방계획\n\n"
+                f"_/menu → 🚨 특별관리결석자 에서 입력_"
+            )
 
             try:
                 await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+                sent += 1
             except Exception as e:
                 logger.warning("send failed to %s: %s", chat_id, e)
                 try:
-                    await context.bot.send_message(chat_id=chat_id,
-                        text=msg.replace("*","").replace("`","").replace("_",""))
-                except Exception:
-                    pass
+                    # 평문 fallback
+                    plain = (
+                        f"🔄 새 주차 시작 - 특별관리 체크리스트 초기화\n"
+                        f"👤 {name} ({dept})\n\n"
+                        f"📋 지난 주 진행: {last_week_txt}\n"
+                        + (f"⚠️ 1. 대책방 초대가 아직 완료되지 않았습니다.\n\n" if not prev["item1_invited"] else "\n")
+                        + f"📌 이번 주 진행할 항목:\n"
+                        f"⬜️ 2. 금주 피드백 진행\n"
+                        f"⬜️ 3. 금주 심방예정일\n"
+                        f"⬜️ 4. 금주 심방계획\n\n"
+                        f"/menu → 🚨 특별관리결석자 에서 입력"
+                    )
+                    await context.bot.send_message(chat_id=chat_id, text=plain)
+                    sent += 1
+                except Exception as e2:
+                    logger.warning("plain send also failed to %s: %s", chat_id, e2)
+                    failed += 1
 
-        try:
-            await sb_rpc("reset_special_weekly_items", {})
-            logger.info("weekly reset done")
-        except Exception as e:
-            logger.warning("weekly reset failed: %s", e)
+        logger.info("🔔 주간 리마인더 완료: 전송 %d / 실패 %d / 총 %d", sent, failed, len(prev_status))
     except Exception as e:
         logger.exception("weekly_reminder_job failed: %s", e)
 
@@ -5204,13 +5241,15 @@ def main():
     app.add_handler(CallbackQueryHandler(button_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
 
-    # 📅 스케줄 (python-telegram-bot v20: 월=0, 화=1, 수=2, 목=3, 금=4, 토=5, 일=6)
+    # 📅 스케줄 (python-telegram-bot v20+: 0=일, 1=월, 2=화, 3=수, 4=목, 5=금, 6=토)
+    # ⚠️ v20.0 부터 요일 매핑이 변경됨: 이전 0=월~6=일 → 0=일~6=토
+    # 따라서 수요일 = 3 (이전에는 2였음)
     if app.job_queue is not None:
         # 🆕 매주 수요일 08:00 KST — 봇 사용자(개인방) 모두에게 타겟 결석자 심방계획 요청
         app.job_queue.run_daily(
             wednesday_visit_plan_request_job,
             time=dtime(hour=8, minute=0, tzinfo=KST),
-            days=(2,),  # 수요일
+            days=(3,),  # 수요일 (v20: 0=일, 3=수)
             name="wednesday_personal_visit_plan",
         )
         logger.info("📅 [매주 수요일 08:00 KST] 개인방 타겟 결석자 심방계획 요청")
@@ -5219,7 +5258,7 @@ def main():
         app.job_queue.run_daily(
             weekly_reminder_job,
             time=dtime(hour=8, minute=0, tzinfo=KST),
-            days=(2,),  # 수요일
+            days=(3,),  # 수요일 (v20: 0=일, 3=수)
             name="wednesday_special_reminder",
         )
         logger.info("📅 [매주 수요일 08:00 KST] 특별관리 그룹방 피드백 회의 요청")
@@ -5228,7 +5267,7 @@ def main():
         app.job_queue.run_daily(
             weekly_rollover_job,
             time=dtime(hour=0, minute=0, tzinfo=KST),
-            days=(2,),  # 수요일
+            days=(3,),  # 수요일 (v20: 0=일, 3=수)
             name="wednesday_weekly_rollover",
         )
         logger.info("📅 [매주 수요일 00:00 KST] 주차 자동 전환")
