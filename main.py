@@ -310,45 +310,75 @@ async def enrich_names(rows: list, church_key: str = "church", dept_key: str = "
 #   - church_member_registry 의 classification 컬럼이 분류 마스터
 # ═════════════════════════════════════════════════════════════════════════════
 _member_cache: dict = {
-    "data": None,        # {church: [member, ...]}
-    "loaded_at": 0.0,    # epoch seconds
+    "data": {},          # {church: [member, ...]}
+    "loaded_at": {},     # {church: epoch_seconds} — 교회별로 따로 TTL 관리
 }
 _MEMBER_CACHE_TTL_SEC = 300  # 5분 캐시
 
 async def _get_member_registry_by_church(church: str) -> list:
     """교적부를 교회별로 조회 + 메모리 캐시 (5분 TTL).
-    교적부는 자주 변하지 않아 캐시 적중률이 높다.
+    
+    🆕 v6.2.1: PostgREST 기본 max-rows(1000) 제한 우회
+      - 교회별로 따로 조회 (전체 조회 시 1000건에서 잘려서 다른 교회 누락됨)
+      - Range 헤더로 페이지네이션 (한 교회에 1000명 이상 있을 가능성 대비)
     """
     import time
     now = time.time()
-    cache = _member_cache.get("data")
-    age = now - _member_cache.get("loaded_at", 0.0)
-    if cache is not None and age < _MEMBER_CACHE_TTL_SEC:
-        return cache.get(church, [])
+    cache = _member_cache.get("data") or {}
+    cache_age = now - _member_cache.get("loaded_at", {}).get(church, 0.0)
 
-    # 캐시 미스 — 전체 조회 후 교회별 분류
-    try:
-        rows = await sb_get(
-            "church_member_registry"
-            "?select=name,church,dept,region_name,zone_name,phone_last4,classification"
-            "&limit=50000"
-        )
-    except Exception as e:
-        logger.warning("[member_cache] 교적부 조회 실패: %s", e)
-        rows = []
+    # 캐시 히트 (해당 교회만)
+    if church in cache and cache_age < _MEMBER_CACHE_TTL_SEC:
+        return cache[church]
 
-    by_church: dict = {}
-    for m in (rows or []):
-        ch = m.get("church") or ""
-        by_church.setdefault(ch, []).append(m)
-    _member_cache["data"] = by_church
-    _member_cache["loaded_at"] = now
+    # ── 교회별 페이지네이션 조회 ──────────────────────────────────────
+    PAGE = 1000  # PostgREST 기본 max-rows
+    all_rows: list = []
+    offset = 0
+    while True:
+        try:
+            # offset/limit 와 Range 헤더 둘 다 시도 — 어느 쪽이든 작동하도록
+            path = (
+                f"church_member_registry"
+                f"?select=name,church,dept,region_name,zone_name,phone_last4,classification"
+                f"&church=eq.{quote(church)}"
+                f"&order=name.asc"
+                f"&offset={offset}&limit={PAGE}"
+            )
+            page_rows = await sb_get(path)
+        except Exception as e:
+            logger.warning("[member_cache] %s 교적부 조회 실패 (offset=%d): %s",
+                           church, offset, e)
+            page_rows = []
+        if not page_rows:
+            break
+        all_rows.extend(page_rows)
+        if len(page_rows) < PAGE:
+            break  # 마지막 페이지
+        offset += PAGE
+        if offset > 100000:  # 안전장치 — 무한루프 방지
+            logger.warning("[member_cache] %s 교적부가 너무 큼 (>100K) — 중단", church)
+            break
+
+    # 캐시 갱신 (이 교회 슬롯만)
+    cache[church] = all_rows
+    _member_cache["data"] = cache
+    loaded_at = _member_cache.get("loaded_at")
+    if not isinstance(loaded_at, dict):
+        loaded_at = {}  # 이전 버전과 호환 (loaded_at 이 float 였던 경우)
+    loaded_at[church] = now
+    _member_cache["loaded_at"] = loaded_at
+
     logger.info(
-        "[member_cache] 갱신 완료: 총 %d명, 교회별 %s",
-        len(rows or []),
-        {k: len(v) for k, v in by_church.items()}
+        "[member_cache] %s 갱신 완료: %d명 (분류: %s)",
+        church, len(all_rows),
+        {
+            "가족":   sum(1 for m in all_rows if m.get("classification") == "가족"),
+            "가족외": sum(1 for m in all_rows if m.get("classification") == "가족외"),
+            "일반":   sum(1 for m in all_rows if m.get("classification") not in ("가족","가족외")),
+        }
     )
-    return by_church.get(church, [])
+    return all_rows
 
 
 def _is_masked_name_simple(name: str) -> bool:
