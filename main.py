@@ -2791,9 +2791,27 @@ async def _on_abs_dept(update: Update, chat_id: int, church: str, dept: str):
 
 
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """텍스트 입력 핸들러 — 리플라이 키보드 / 지역·구역 / 심방 단계 / 특별관리 3·4번"""
+    """텍스트 입력 핸들러 — 리플라이 키보드 / 지역·구역 / 심방 단계 / 특별관리 3·4번
+    
+    🆕 v6.1: 텍스트가 아닌 메시지(사진/스티커/시스템메시지/편집알림 등) 방어 가드
+              - update.message 자체가 None 인 경우 (edited_message 등)
+              - update.message.text 가 None 인 경우 (사진/스티커/위치/이모티콘 등)
+              - update.effective_chat 가 None 인 경우 (드물지만 채널/익명 메시지)
+            이 경우들은 봇이 처리할 수 없으니 조용히 return.
+    """
+    # ── 0) 방어 가드 ──────────────────────────────────────────────
+    msg = update.message or update.edited_message
+    if msg is None:
+        return  # 메시지 객체 없음 (드물게 callback/poll 등이 잘못 라우팅된 경우)
+    if msg.text is None:
+        return  # 텍스트 아님 (사진/스티커/위성/연락처/시스템메시지 등)
+    if update.effective_chat is None:
+        return  # 채팅 식별 불가
+
     chat_id = update.effective_chat.id
-    text = update.message.text.strip()
+    text = msg.text.strip()
+    if not text:
+        return  # 공백만 있는 메시지
 
     # 🆕 v6.0: 봇이 반응할 텍스트인지 먼저 판단
     #   일반 대화에는 봇이 반응하지 않게 — 권한 체크 메시지조차 보내지 않음
