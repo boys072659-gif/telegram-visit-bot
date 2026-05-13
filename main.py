@@ -414,19 +414,92 @@ async def clear_tmp(chat_id: int):
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 구역 정규화 (2-1 ↔ 2팀1)
+# 🆕 v6.1: 더 많은 표기 변형 인식 + 매칭용 후보 생성
 # ═════════════════════════════════════════════════════════════════════════════
 def normalize_zone(z: str) -> str:
+    """구역명을 표준 형태 (예: '3팀5') 로 정규화.
+    
+    인식 형태:
+      - 숫자-숫자: '3-5', '3_5', '3.5', '3/5', '3 - 5' → '3팀5'
+      - 숫자팀숫자: '3팀5', '3 팀 5' → '3팀5'
+      - 한글-숫자: '사랑-1', '노민-2', '사랑 1', '사랑1' → '사랑1'
+      - 그 외: 공백만 제거 후 그대로 반환
+    """
     if not z: return ""
-    s = re.sub(r"\s+", "", z.strip())
-    m = re.match(r"^(\d+)[-_](\d+)$", s)
+    # 1) 모든 종류의 공백 제거
+    s = re.sub(r"\s+", "", str(z).strip())
+    if not s: return ""
+
+    # 2) 숫자-숫자 형식 (-, _, ., /, : 모두 포함)
+    m = re.match(r"^(\d+)[-_./:](\d+)$", s)
     if m: return f"{m.group(1)}팀{m.group(2)}"
+
+    # 3) 이미 정규화된 형태 '숫자팀숫자'
     m = re.match(r"^(\d+)팀(\d+)$", s)
     if m: return f"{m.group(1)}팀{m.group(2)}"
+
+    # 4) 한글-숫자 (예: '사랑-1' → '사랑1')
+    m = re.match(r"^([가-힣]+)[-_./:\s]+(\d+)$", s)
+    if m: return f"{m.group(1)}{m.group(2)}"
+
+    # 5) 한글+숫자 그대로 (예: '사랑1') 또는 그 외 → 공백만 제거된 형태
     return s
 
+
+def zone_candidates(z: str) -> list:
+    """🆕 v6.1: 구역 매칭 시 시도할 모든 변형 후보 반환.
+    
+    DB 데이터가 어떤 표기로 저장돼 있더라도 매칭 가능하도록
+    가능한 모든 표기를 OR 검색에 사용한다.
+    
+    예: '3-5' 입력 시 → ['3팀5', '3-5', '3_5', '3.5', '3/5']
+        '3팀5' 입력 시 → ['3팀5', '3-5', '3_5', '3.5', '3/5']
+        '사랑-1' 입력 시 → ['사랑1', '사랑-1', '사랑_1']
+    """
+    if not z: return []
+    s = re.sub(r"\s+", "", str(z).strip())
+    if not s: return []
+
+    candidates = set()
+    candidates.add(s)  # 원본 (공백만 제거)
+
+    # 숫자-숫자 패턴 추출
+    m1 = re.match(r"^(\d+)[-_./:](\d+)$", s)
+    m2 = re.match(r"^(\d+)팀(\d+)$", s)
+    if m1 or m2:
+        a, b = (m1.group(1), m1.group(2)) if m1 else (m2.group(1), m2.group(2))
+        candidates.add(f"{a}팀{b}")
+        candidates.add(f"{a}-{b}")
+        candidates.add(f"{a}_{b}")
+        candidates.add(f"{a}.{b}")
+        candidates.add(f"{a}/{b}")
+        return list(candidates)
+
+    # 한글-숫자 패턴
+    m3 = re.match(r"^([가-힣]+)[-_./:\s]+(\d+)$", s)
+    m4 = re.match(r"^([가-힣]+)(\d+)$", s)
+    if m3 or m4:
+        a, b = (m3.group(1), m3.group(2)) if m3 else (m4.group(1), m4.group(2))
+        candidates.add(f"{a}{b}")
+        candidates.add(f"{a}-{b}")
+        candidates.add(f"{a}_{b}")
+        candidates.add(f"{a} {b}")
+        return list(candidates)
+
+    # 매칭 안 되는 형태 → 원본만
+    return list(candidates)
+
+
 def looks_like_zone(text: str) -> bool:
+    """구역명처럼 보이는 입력 판정.
+    🆕 v6.1: 한글-숫자 형태도 인식 (예: '사랑-1', '노민-2')
+    """
     s = re.sub(r"\s+", "", text.strip())
-    return bool(re.match(r"^\d+[-_팀]\d+$", s))
+    # 숫자[-_팀./:]숫자
+    if re.match(r"^\d+[-_팀./:]\d+$", s): return True
+    # 한글[-_./:공백]숫자
+    if re.match(r"^[가-힣]+[-_./:]\d+$", s): return True
+    return False
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -465,7 +538,9 @@ async def fetch_absentees_by_region(week_key: str, church: str, dept: str, regio
 
 
 async def fetch_absentees_by_zone(week_key: str, church: str, dept: str, zone: str):
-    """교회+부서+구역으로 결석자 조회."""
+    """교회+부서+구역으로 결석자 조회.
+    🆕 v6.1: zone 매칭 시 여러 표기 변형 모두 시도 (OR 검색)
+    """
     normalized = normalize_zone(zone)
     # RPC 시도
     try:
@@ -477,24 +552,35 @@ async def fetch_absentees_by_zone(week_key: str, church: str, dept: str, zone: s
         for r in rows:
             if not r.get("dept"): r["dept"] = dept
             if not r.get("church"): r["church"] = church
-        return await enrich_names(rows)
+        if rows:
+            return await enrich_names(rows)
+        # RPC 가 0건이면 REST 폴백으로 OR 매칭 시도
     except Exception as e:
         logger.info("RPC get_absentees_by_dept_zone 폴백: %s", e)
 
-    # REST 폴백 - 정규화된 구역명으로 시도, 실패 시 원본으로
-    for try_zone in [normalized, zone]:
-        path = (
-            f"weekly_visit_targets"
-            f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
-            f"&week_key=eq.{quote(week_key)}"
-            f"&church=eq.{quote(church)}"
-            f"&dept=eq.{quote(dept)}"
-            f"&zone_name=eq.{quote(try_zone)}"
-            f"&order=name.asc"
-        )
-        rows = await sb_get(path)
-        if rows: return await enrich_names(rows)
-    return []
+    # REST 폴백 - 여러 표기 변형 OR 매칭
+    candidates = zone_candidates(zone)
+    base = (
+        f"weekly_visit_targets"
+        f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
+        f"&week_key=eq.{quote(week_key)}"
+        f"&church=eq.{quote(church)}"
+        f"&dept=eq.{quote(dept)}"
+    )
+    if len(candidates) == 1:
+        path = base + f"&zone_name=eq.{quote(candidates[0])}&order=name.asc"
+    elif len(candidates) > 1:
+        quoted = ",".join(f'"{c}"' for c in candidates)
+        path = base + f"&zone_name=in.({quote(quoted)})&order=name.asc"
+    else:
+        return []
+
+    logger.info(
+        "[fetch_absentees_by_zone] church=%s dept=%s zone=%r cands=%s",
+        church, dept, zone, candidates
+    )
+    rows = await sb_get(path)
+    return await enrich_names(rows or [])
 
 
 async def fetch_absentees_4plus(week_key: str, church: str, dept: str):
@@ -1572,7 +1658,9 @@ def scope_label(s: dict) -> str:
 
 
 async def scope_filter_absentees(chat_id: int, week_key: str) -> list:
-    """현재 방의 scope에 맞는 결석자 목록 반환."""
+    """현재 방의 scope에 맞는 결석자 목록 반환.
+    🆕 v6.1: zone 매칭 시 여러 표기 변형 모두 시도 (OR 검색)
+    """
     s = await get_chat_scope(chat_id)
     if not s or not s.get("church"):
         return []
@@ -1588,7 +1676,12 @@ async def scope_filter_absentees(chat_id: int, week_key: str) -> list:
     if s.get("region_name"):
         path += f"&region_name=eq.{quote(s['region_name'])}"
     if s.get("zone_name"):
-        path += f"&zone_name=eq.{quote(normalize_zone(s['zone_name']))}"
+        cands = zone_candidates(s["zone_name"])
+        if len(cands) == 1:
+            path += f"&zone_name=eq.{quote(cands[0])}"
+        elif len(cands) > 1:
+            quoted = ",".join(f'"{c}"' for c in cands)
+            path += f"&zone_name=in.({quote(quoted)})"
     path += "&order=dept.asc,region_name.asc,name.asc&limit=5000"
     rows = await sb_get(path)
     return await enrich_names(rows)
@@ -1832,7 +1925,9 @@ async def _on_scope_text_input(update: Update, chat_id: int, text: str):
         return True
 
     if step == "awaiting_scope_zone_text":
-        zone = text.strip()
+        zone_raw = text.strip()
+        # 🆕 v6.1: 저장 직전 정규화 — DB 와 일관성 확보 (모든 사용자가 같은 표기로 저장)
+        zone = normalize_zone(zone_raw) if zone_raw else ""
         church = ctx.get("church_filter") or ""
         dept = ctx.get("dept_filter") or ""
         region = ctx.get("region_filter") or ""
@@ -1863,6 +1958,11 @@ async def _on_scope_text_input(update: Update, chat_id: int, text: str):
             owner_name=owner_name,
         )
         await clear_tmp(chat_id)
+        # 🆕 v6.1: 정규화 결과 로그 — 이후 매칭 실패 시 추적용
+        logger.info(
+            "[scope_save] chat=%s church=%s dept=%s region=%s zone_raw=%r → zone_saved=%r",
+            chat_id, church, dept, region, zone_raw, zone
+        )
 
         new_scope = {"church": church, "dept": dept, "region_name": region, "zone_name": zone}
         await safe_reply_text(
@@ -2568,24 +2668,65 @@ def _escape_html(s) -> str:
 
 
 async def _fetch_scoped(week_key, church, dept, region, zone, flow):
-    """scope 범위 + flow (abs/sp) 에 맞춰 결석자 목록 반환"""
-    path = (
+    """scope 범위 + flow (abs/sp) 에 맞춰 결석자 목록 반환.
+    
+    🆕 v6.1: zone 매칭 시 여러 표기 변형 모두 시도 (OR 검색)
+              - DB 가 '3팀5' 로 저장되어 있고 scope 에 '3-5' 로 저장돼 있어도 매칭
+              - 한글 구역 ('사랑-1' 등) 도 동일 처리
+              - 1차 매칭 실패 시 region 만으로 fallback (그룹방에서 구역 매칭 누락 시
+                완전히 비는 일이 없게 — 분석 후 빈 경우 빈 결과 반환)
+    """
+    base = (
         f"weekly_visit_targets"
         f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
         f"&week_key=eq.{quote(week_key)}"
         f"&church=eq.{quote(church)}"
     )
-    if dept:   path += f"&dept=eq.{quote(dept)}"
-    if region: path += f"&region_name=eq.{quote(region)}"
-    if zone:   path += f"&zone_name=eq.{quote(normalize_zone(zone))}"
-    if flow == "sp":
-        path += "&consecutive_absent_count=gte.4"
-        path += "&order=consecutive_absent_count.desc,name.asc"
-    else:
-        path += "&order=dept.asc,region_name.asc,zone_name.asc,name.asc"
-    path += "&limit=5000"
+    if dept:   base += f"&dept=eq.{quote(dept)}"
+    if region: base += f"&region_name=eq.{quote(region)}"
 
+    # zone 필터: OR 매칭 (여러 표기 변형 모두 시도)
+    zone_filter = ""
+    candidates: list = []
+    if zone:
+        candidates = zone_candidates(zone)
+        if len(candidates) == 1:
+            zone_filter = f"&zone_name=eq.{quote(candidates[0])}"
+        elif len(candidates) > 1:
+            # PostgREST in.(a,b,c) — 쉼표/괄호 회피용 따옴표는 PostgREST 가
+            # 안전하게 처리해 줌. 항목 자체에 쉼표/괄호가 들어가는 경우는 없으니 안전.
+            quoted = ",".join(f'"{c}"' for c in candidates)
+            zone_filter = f"&zone_name=in.({quote(quoted)})"
+
+    flow_suffix = ""
+    if flow == "sp":
+        flow_suffix = "&consecutive_absent_count=gte.4&order=consecutive_absent_count.desc,name.asc"
+    else:
+        flow_suffix = "&order=dept.asc,region_name.asc,zone_name.asc,name.asc"
+    flow_suffix += "&limit=5000"
+
+    path = base + zone_filter + flow_suffix
+    logger.info(
+        "[_fetch_scoped] flow=%s church=%s dept=%s region=%s zone=%r cands=%s",
+        flow, church, dept, region, zone, candidates
+    )
     rows = await sb_get(path)
+
+    # 🆕 v6.1: 결과 0 이고 zone 필터를 걸었으면 — 디버그용으로 zone 없이 한번 더 확인
+    #          (사용자에게는 빈 결과 그대로 표시하되, 로그로 '왜 비었나' 추적)
+    if not rows and zone:
+        try:
+            debug_path = base + flow_suffix.replace("&limit=5000", "&limit=50")
+            sample = await sb_get(debug_path)
+            sample_zones = sorted({(r.get("zone_name") or "") for r in (sample or [])})
+            logger.warning(
+                "[_fetch_scoped] zone 매칭 0건! church=%s dept=%s region=%s zone=%r cands=%s "
+                "→ 같은 범위에 실제 존재하는 zone_name 들 (최대 50건): %s",
+                church, dept, region, zone, candidates, sample_zones
+            )
+        except Exception as e:
+            logger.warning("[_fetch_scoped] 디버그 조회 실패: %s", e)
+
     return await enrich_names(rows or [])
 
 
