@@ -304,6 +304,163 @@ async def enrich_names(rows: list, church_key: str = "church", dept_key: str = "
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 🆕 v6.2: 교적 분류(가족/가족외/일반) 매칭
+#   - 가족, 가족외는 연속결석 1회 이상부터 특별관리 대상
+#   - 일반은 기존대로 4회 이상
+#   - church_member_registry 의 classification 컬럼이 분류 마스터
+# ═════════════════════════════════════════════════════════════════════════════
+_member_cache: dict = {
+    "data": None,        # {church: [member, ...]}
+    "loaded_at": 0.0,    # epoch seconds
+}
+_MEMBER_CACHE_TTL_SEC = 300  # 5분 캐시
+
+async def _get_member_registry_by_church(church: str) -> list:
+    """교적부를 교회별로 조회 + 메모리 캐시 (5분 TTL).
+    교적부는 자주 변하지 않아 캐시 적중률이 높다.
+    """
+    import time
+    now = time.time()
+    cache = _member_cache.get("data")
+    age = now - _member_cache.get("loaded_at", 0.0)
+    if cache is not None and age < _MEMBER_CACHE_TTL_SEC:
+        return cache.get(church, [])
+
+    # 캐시 미스 — 전체 조회 후 교회별 분류
+    try:
+        rows = await sb_get(
+            "church_member_registry"
+            "?select=name,church,dept,region_name,zone_name,phone_last4,classification"
+            "&limit=50000"
+        )
+    except Exception as e:
+        logger.warning("[member_cache] 교적부 조회 실패: %s", e)
+        rows = []
+
+    by_church: dict = {}
+    for m in (rows or []):
+        ch = m.get("church") or ""
+        by_church.setdefault(ch, []).append(m)
+    _member_cache["data"] = by_church
+    _member_cache["loaded_at"] = now
+    logger.info(
+        "[member_cache] 갱신 완료: 총 %d명, 교회별 %s",
+        len(rows or []),
+        {k: len(v) for k, v in by_church.items()}
+    )
+    return by_church.get(church, [])
+
+
+def _is_masked_name_simple(name: str) -> bool:
+    return bool(name) and ("*" in name or "ㅇ" in name)
+
+
+def _classify_one(name: str, phone4: str, church: str, members: list) -> str:
+    """1명의 결석자를 교적부와 매칭해 분류('가족'/'가족외'/'일반') 반환.
+    
+    매칭 우선순위 (클라이언트 코드와 동일한 로직):
+      1) church + name + phone_last4 완전 일치
+      2) church + name 일치 (전화 무시)
+      3) 마스킹 이름 복구 (church + phone_last4 + 이름 길이/패턴)
+      4) name + phone_last4 일치 (교회 무시)
+      5) name 만 일치 (최후 수단)
+    매칭 실패 시 '일반' 반환.
+    """
+    if not members:
+        return "일반"
+    cn = (name or "").strip()
+    cp = (phone4 or "").strip()
+    cc = (church or "").strip()
+    if not cn:
+        return "일반"
+
+    # 1차: church + name + phone
+    if cc and cp:
+        for m in members:
+            if m.get("name") == cn and (m.get("phone_last4") or "") == cp:
+                return m.get("classification") or "일반"
+    # 2차: church + name (전화 무시) — members 는 이미 church 필터됨
+    for m in members:
+        if m.get("name") == cn:
+            return m.get("classification") or "일반"
+
+    # 3차: 마스킹 이름 복구 ('박*연' 형태)
+    if _is_masked_name_simple(cn):
+        parts = re.split(r"[*ㅇ]", cn)
+        head = parts[0] if parts else ""
+        tail = parts[-1] if parts else ""
+        for m in members:
+            mn = m.get("name") or ""
+            if not mn or len(mn) != len(cn):
+                continue
+            if not mn.startswith(head) or not mn.endswith(tail):
+                continue
+            # 전화도 일치하면 더 신뢰
+            if cp and (m.get("phone_last4") or "") == cp:
+                return m.get("classification") or "일반"
+        # 전화 매칭 실패 시 패턴만으로 한번 더
+        for m in members:
+            mn = m.get("name") or ""
+            if mn and len(mn) == len(cn) and mn.startswith(head) and mn.endswith(tail):
+                return m.get("classification") or "일반"
+
+    # 4·5차: 교회 무시 매칭은 다른 교회 동명이인 위험 — 여기서는 시도 안 함
+    return "일반"
+
+
+async def classify_absentees(rows: list, church: str) -> list:
+    """🆕 v6.2: 결석자 목록 각 행에 _classification 필드 부여.
+    
+    rows 의 각 항목에 '_classification' = '가족'/'가족외'/'일반' 추가.
+    원본 리스트를 변형하므로 호출 측은 반환값을 그대로 받아 쓰면 된다.
+    """
+    if not rows:
+        return rows
+    members = await _get_member_registry_by_church(church)
+    for r in rows:
+        try:
+            r["_classification"] = _classify_one(
+                r.get("name", ""),
+                r.get("phone_last4", "") or "",
+                r.get("church", "") or church,
+                members,
+            )
+        except Exception as e:
+            logger.debug("classify_one 실패 name=%r: %s", r.get("name"), e)
+            r["_classification"] = "일반"
+    return rows
+
+
+def is_special_target(row: dict) -> bool:
+    """🆕 v6.2: 특별관리 대상자 판정.
+    
+    기준:
+      - 가족   → 연속결석 ≥ 1
+      - 가족외 → 연속결석 ≥ 1
+      - 일반   → 연속결석 ≥ 4 (기존 유지)
+    
+    호출 전 classify_absentees() 로 '_classification' 부여돼 있어야 함.
+    """
+    cls = (row.get("_classification") or "일반")
+    streak = row.get("consecutive_absent_count", 0) or 0
+    if cls in ("가족", "가족외"):
+        return streak >= 1
+    return streak >= 4
+
+
+def cls_tag(row: dict) -> str:
+    """🆕 v6.2: 표시용 분류 태그.
+       '가족'   → '[가족] '
+       '가족외' → '[가족외] '
+       '일반'   → ''  (라벨 짧게 유지)
+    """
+    cls = row.get("_classification") or ""
+    if cls == "가족":   return "[가족] "
+    if cls == "가족외": return "[가족외] "
+    return ""
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # 주차 계산 (🆕 v5.1 일요일 기준 — 항상 직전 일요일이 속한 주차)
 # ═════════════════════════════════════════════════════════════════════════════
 def compute_target_week_key() -> tuple[str, str]:
@@ -584,8 +741,22 @@ async def fetch_absentees_by_zone(week_key: str, church: str, dept: str, zone: s
 
 
 async def fetch_absentees_4plus(week_key: str, church: str, dept: str):
-    """4회 이상 연속결석자 (교회+부서)."""
+    """특별관리 대상자 (교회+부서).
+    
+    🆕 v6.2: 분류별 기준 적용
+      - 가족, 가족외 → 연속결석 ≥ 1
+      - 일반        → 연속결석 ≥ 4 (기존)
+    함수명은 호환을 위해 유지하지만 의미는 '특별관리 대상자' 로 확장됨.
+    
+    구현:
+      DB 에서 연속결석 1회 이상 전부 가져온 뒤 (RPC 또는 REST)
+      교적부 매칭으로 분류 부여 → is_special_target() 로 필터.
+    """
+    # ── 1) 후보 수집 (연속결석 ≥ 1) ─────────────────────────────────────
+    raw: list = []
     try:
+        # 기존 RPC 가 4회+만 반환할 수 있으므로 (DB 함수 시그니처가 그렇게 굳어 있으면)
+        # 일단 시도하되 결과 부족하면 REST 로 폴백.
         rows = await sb_rpc("get_absentees_4plus_by_dept", {
             "p_week_key": week_key, "p_dept": dept
         })
@@ -594,21 +765,46 @@ async def fetch_absentees_4plus(week_key: str, church: str, dept: str):
         for r in rows:
             if not r.get("dept"): r["dept"] = dept
             if not r.get("church"): r["church"] = church
-        return await enrich_names(rows)
+        # 가족/가족외 1회+ 잡으려면 RPC 결과만으로는 부족.
+        # → 항상 REST 도 같이 돌려서 합친다 (RPC 가 가져온 4회+ 는 자연히 포함됨)
+        raw = list(rows)
     except Exception as e:
         logger.info("RPC get_absentees_4plus_by_dept 폴백: %s", e)
 
+    # REST: 연속결석 ≥ 1 전부 (가족/가족외 후보 포함)
     path = (
         f"weekly_visit_targets"
         f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
         f"&week_key=eq.{quote(week_key)}"
         f"&church=eq.{quote(church)}"
         f"&dept=eq.{quote(dept)}"
-        f"&consecutive_absent_count=gte.4"
+        f"&consecutive_absent_count=gte.1"
         f"&order=consecutive_absent_count.desc,name.asc"
+        f"&limit=5000"
     )
-    rows = await sb_get(path)
-    return await enrich_names(rows)
+    rest_rows = await sb_get(path) or []
+    # 중복 제거 (row_id 기준 — RPC + REST 합칠 때 안전)
+    seen = set()
+    merged = []
+    for r in (raw + rest_rows):
+        rid = r.get("row_id") or (r.get("name", ""), r.get("phone_last4", "") or "")
+        key = rid if isinstance(rid, tuple) else str(rid)
+        if key in seen: continue
+        seen.add(key)
+        merged.append(r)
+
+    # ── 2) 분류 부여 + 필터 ────────────────────────────────────────────
+    merged = await classify_absentees(merged, church)
+    targets = [r for r in merged if is_special_target(r)]
+
+    # ── 3) 정렬: 가족 → 가족외 → 일반 순, 그 안에서 연속결석 내림차순 ───
+    cls_order = {"가족": 0, "가족외": 1, "일반": 2}
+    targets.sort(key=lambda r: (
+        cls_order.get(r.get("_classification", "일반"), 9),
+        -(r.get("consecutive_absent_count", 0) or 0),
+        r.get("name", ""),
+    ))
+    return await enrich_names(targets)
 
 
 async def get_progress(week_key: str, row_id: str):
@@ -2700,7 +2896,9 @@ async def _fetch_scoped(week_key, church, dept, region, zone, flow):
 
     flow_suffix = ""
     if flow == "sp":
-        flow_suffix = "&consecutive_absent_count=gte.4&order=consecutive_absent_count.desc,name.asc"
+        # 🆕 v6.2: 가족/가족외는 1회+, 일반은 4회+ 룰 → 일단 1회+ 전부 가져온 뒤
+        #          교적 매칭으로 분류 부여 → is_special_target() 로 필터
+        flow_suffix = "&consecutive_absent_count=gte.1&order=consecutive_absent_count.desc,name.asc"
     else:
         flow_suffix = "&order=dept.asc,region_name.asc,zone_name.asc,name.asc"
     flow_suffix += "&limit=5000"
@@ -2727,18 +2925,43 @@ async def _fetch_scoped(week_key, church, dept, region, zone, flow):
         except Exception as e:
             logger.warning("[_fetch_scoped] 디버그 조회 실패: %s", e)
 
-    return await enrich_names(rows or [])
+    rows = rows or []
+
+    # 🆕 v6.2: sp 흐름이면 분류 부여 + 룰 적용
+    if flow == "sp" and rows:
+        rows = await classify_absentees(rows, church)
+        before = len(rows)
+        rows = [r for r in rows if is_special_target(r)]
+        # 정렬: 가족 → 가족외 → 일반, 그 안에서 연속결석 내림차순
+        cls_order = {"가족": 0, "가족외": 1, "일반": 2}
+        rows.sort(key=lambda r: (
+            cls_order.get(r.get("_classification", "일반"), 9),
+            -(r.get("consecutive_absent_count", 0) or 0),
+            r.get("name", ""),
+        ))
+        logger.info(
+            "[_fetch_scoped] sp 분류 필터: %d → %d (가족/가족외 1+, 일반 4+)",
+            before, len(rows)
+        )
+
+    return await enrich_names(rows)
 
 
 def _build_absentee_buttons(rows, flow, max_buttons=40):
-    """결석자 이름 버튼 목록 생성 (페이지네이션 고려)"""
+    """결석자 이름 버튼 목록 생성 (페이지네이션 고려).
+    🆕 v6.2: sp 흐름이면 라벨 앞에 [가족]/[가족외] 태그 추가
+    """
     keyboard = []
     cb_prefix = "sp_pk" if flow == "sp" else "abs_sel"
     for r in rows[:max_buttons]:
         name = r.get("name", "?")
         zone = r.get("zone_name", "") or r.get("region_name", "") or ""
         streak = r.get("consecutive_absent_count", 0) or 0
-        label = f"{name} {zone} · 연속{streak}회" if zone else f"{name} · 연속{streak}회"
+        tag = cls_tag(r) if flow == "sp" else ""
+        if zone:
+            label = f"{tag}{name} {zone} · 연속{streak}회"
+        else:
+            label = f"{tag}{name} · 연속{streak}회"
         if len(label) > 60: label = label[:57] + "..."
         keyboard.append([InlineKeyboardButton(label, callback_data=f"{cb_prefix}:{r['row_id']}")])
     if len(rows) > max_buttons:
@@ -3659,7 +3882,8 @@ async def _on_sp_dept(update: Update, chat_id: int, church: str, dept: str):
     targets = await enrich_names(targets)
     if not targets:
         await q.edit_message_text(
-            f"📭 <b>{_html.escape(church)} / {_html.escape(dept)}</b> 의 연속결석 4회 이상 결석자가 없습니다.\n"
+            f"📭 <b>{_html.escape(church)} / {_html.escape(dept)}</b> 의 특별관리 대상자가 없습니다.\n"
+            f"<i>(가족·가족외 1회+, 일반 4회+)</i>\n"
             f"(주차: {_html.escape(week_label or week_key)})",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
@@ -3693,7 +3917,8 @@ async def _on_sp_dept(update: Update, chat_id: int, church: str, dept: str):
         row_id = t.get("row_id", "")
         is_reg = (name, phone) in registered_set
         mark = "🚨" if is_reg else "⚠️"
-        label = f"{mark} {name} ({region} {zone}) · {streak}회"
+        tag = cls_tag(t)  # 🆕 v6.2: [가족]/[가족외] 태그
+        label = f"{mark} {tag}{name} ({region} {zone}) · {streak}회"
         if len(label) > 60:
             label = label[:57] + "..."
         buttons.append([InlineKeyboardButton(
@@ -3703,9 +3928,20 @@ async def _on_sp_dept(update: Update, chat_id: int, church: str, dept: str):
     buttons.append([InlineKeyboardButton("◀ 부서 다시 선택", callback_data=f"sp_ch:{church}")])
     buttons.append([InlineKeyboardButton("◀ 메인 메뉴",       callback_data="m:home")])
 
+    # 🆕 v6.2: 분류별 카운트
+    cnt_fam = sum(1 for t in targets if t.get("_classification") == "가족")
+    cnt_non = sum(1 for t in targets if t.get("_classification") == "가족외")
+    cnt_gen = sum(1 for t in targets if t.get("_classification") not in ("가족", "가족외"))
+    breakdown_parts = []
+    if cnt_fam: breakdown_parts.append(f"가족 {cnt_fam}명(1+회)")
+    if cnt_non: breakdown_parts.append(f"가족외 {cnt_non}명(1+회)")
+    if cnt_gen: breakdown_parts.append(f"일반 {cnt_gen}명(4+회)")
+    breakdown = " · ".join(breakdown_parts) if breakdown_parts else "0명"
+
     overflow_note = f"\n\n<i>(+ {overflow}명은 화면 제한으로 생략 — 연속결석 순 상위 {MAX_TARGETS}명만 표시)</i>" if overflow > 0 else ""
     txt = (
-        f"🚨 <b>{_html.escape(church)} / {_html.escape(dept)}</b> — 4회 이상 {len(targets)}명\n"
+        f"🚨 <b>{_html.escape(church)} / {_html.escape(dept)}</b> — 특별관리 {len(targets)}명\n"
+        f"<i>({_html.escape(breakdown)})</i>\n"
         f"주차: {_html.escape(week_label or week_key)}\n\n"
         f"🚨 = 특별관리 등록됨 (방 감지중)\n"
         f"⚠️ = 아직 미등록\n\n"
