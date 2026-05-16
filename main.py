@@ -693,20 +693,29 @@ def looks_like_zone(text: str) -> bool:
 # 결석자 조회 (RPC 시도 → REST 폴백)
 # ═════════════════════════════════════════════════════════════════════════════
 async def fetch_absentees_by_region(week_key: str, church: str, dept: str, region: str):
-    """교회+부서+지역으로 결석자 조회. RPC 실패 시 REST 폴백."""
+    """교회+부서+지역으로 결석자 조회. RPC 실패 시 REST 폴백.
+    
+    🆕 v6.2.2: RPC 결과를 church/dept 로 엄격하게 재필터 — 다른 교회/부서 누수 방지
+      (이전 버그: r.get("church", church) == church 패턴이 church 필드 없는 행을
+       무조건 통과시켜 5교회 같은 부서 데이터가 섞여 보이는 문제 있었음)
+    """
     # RPC 시도
     try:
         rows = await sb_rpc("get_absentees_by_dept_region", {
             "p_week_key": week_key, "p_dept": dept, "p_region": region
         })
         if rows is None: rows = []
-        # RPC는 church 필터가 없으니 클라이언트에서 교회 필터
-        rows = [r for r in rows if r.get("church", church) == church or not r.get("church")]
-        # dept 정보를 추가 (RPC가 반환 안 할 수 있음)
+        # 엄격한 church/dept 필터 (모르면 통과시키지 않음 — 안전 우선)
+        rows = [
+            r for r in rows
+            if (r.get("church") == church)
+            and (not r.get("dept") or r.get("dept") == dept)
+        ]
         for r in rows:
             if not r.get("dept"): r["dept"] = dept
-            if not r.get("church"): r["church"] = church
-        return await enrich_names(rows)
+        if rows:
+            return await enrich_names(rows)
+        # RPC 가 0건이면 REST 폴백
     except Exception as e:
         logger.info("RPC get_absentees_by_dept_region 폴백: %s", e)
 
@@ -721,12 +730,13 @@ async def fetch_absentees_by_region(week_key: str, church: str, dept: str, regio
         f"&order=zone_name.asc,name.asc"
     )
     rows = await sb_get(path)
-    return await enrich_names(rows)
+    return await enrich_names(rows or [])
 
 
 async def fetch_absentees_by_zone(week_key: str, church: str, dept: str, zone: str):
     """교회+부서+구역으로 결석자 조회.
     🆕 v6.1: zone 매칭 시 여러 표기 변형 모두 시도 (OR 검색)
+    🆕 v6.2.2: RPC 결과를 church/dept 로 엄격하게 재필터 (다른 교회/부서 누수 방지)
     """
     normalized = normalize_zone(zone)
     # RPC 시도
@@ -735,10 +745,14 @@ async def fetch_absentees_by_zone(week_key: str, church: str, dept: str, zone: s
             "p_week_key": week_key, "p_dept": dept, "p_zone": normalized
         })
         if rows is None: rows = []
-        rows = [r for r in rows if r.get("church", church) == church or not r.get("church")]
+        # 엄격한 church/dept 필터
+        rows = [
+            r for r in rows
+            if (r.get("church") == church)
+            and (not r.get("dept") or r.get("dept") == dept)
+        ]
         for r in rows:
             if not r.get("dept"): r["dept"] = dept
-            if not r.get("church"): r["church"] = church
         if rows:
             return await enrich_names(rows)
         # RPC 가 0건이면 REST 폴백으로 OR 매칭 시도
@@ -791,10 +805,20 @@ async def fetch_absentees_4plus(week_key: str, church: str, dept: str):
             "p_week_key": week_key, "p_dept": dept
         })
         if rows is None: rows = []
-        rows = [r for r in rows if r.get("church", church) == church or not r.get("church")]
+        # 🆕 v6.2.2: 엄격한 church/dept 필터 (RPC 가 다른 교회/부서까지 반환할 가능성 방어)
+        before_filter = len(rows)
+        rows = [
+            r for r in rows
+            if (r.get("church") == church)
+            and (not r.get("dept") or r.get("dept") == dept)
+        ]
+        if before_filter != len(rows):
+            logger.info(
+                "[fetch_absentees_4plus] RPC 결과 필터: %d → %d (church=%s dept=%s)",
+                before_filter, len(rows), church, dept
+            )
         for r in rows:
             if not r.get("dept"): r["dept"] = dept
-            if not r.get("church"): r["church"] = church
         # 가족/가족외 1회+ 잡으려면 RPC 결과만으로는 부족.
         # → 항상 REST 도 같이 돌려서 합친다 (RPC 가 가져온 4회+ 는 자연히 포함됨)
         raw = list(rows)
@@ -3924,9 +3948,12 @@ async def _on_sp_dept(update: Update, chat_id: int, church: str, dept: str):
         return
 
     # 기등록(방 감지중) 확인
+    # 🆕 v6.2.2: church 필터 추가 — 5교회에 같은 부서명(예: 청년회)이 있을 때
+    #            다른 교회의 등록 정보가 잘못 매칭되지 않도록 방어
     try:
         registered = await sb_get(
-            f"special_management_targets?select=name,phone_last4,monitor_chat_id"
+            f"special_management_targets?select=name,phone_last4,monitor_chat_id,church,dept"
+            f"&church=eq.{quote(church)}"
             f"&dept=eq.{quote(dept)}"
         )
         registered_set = {(r.get("name",""), r.get("phone_last4","") or "") for r in registered}
