@@ -5847,10 +5847,10 @@ def main():
             reg_rows = await sb_get(
                 "church_member_registry?select=name,dept,phone_last4,church&limit=50000"
             ) or []
-            # (name, dept, phone) → church 매핑
+            # (dept, phone_last4) → church 매핑 (이름은 마스킹/실명 불일치 가능하므로 제외)
             reg_map = {}
             for r in reg_rows:
-                key = (r.get("name") or "", r.get("dept") or "", r.get("phone_last4") or "")
+                key = (r.get("dept") or "", r.get("phone_last4") or "")
                 reg_map[key] = r.get("church") or ""
 
             # 결과로 변환
@@ -5860,7 +5860,7 @@ def main():
                 cid = s.get("monitor_chat_id")
                 if not cid or cid in seen_chat_ids:
                     continue
-                key = (s.get("name") or "", s.get("dept") or "", s.get("phone_last4") or "")
+                key = (s.get("dept") or "", s.get("phone_last4") or "")
                 church = reg_map.get(key, "")
 
                 # scope 별 필터
