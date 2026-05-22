@@ -5840,18 +5840,19 @@ def main():
 
         # 🆕 특별관리 대상자 대책방 발송
         if scope_type in ("special", "special_church", "special_dept"):
-            sp_qs = "special_management_targets?select=name,dept,phone_last4,monitor_chat_id,region_name,zone_name&monitor_chat_id=not.is.null&limit=5000"
+            sp_qs = "special_management_targets?select=name,dept,phone_last4,monitor_chat_id,region_name,zone_name,church&monitor_chat_id=not.is.null&limit=5000"
             sp_rows = await sb_get(sp_qs) or []
 
-            # name+dept+phone_last4 → registry 매칭으로 church 찾기
-            reg_rows = await sb_get(
-                "church_member_registry?select=name,dept,phone_last4,church&limit=50000"
-            ) or []
-            # (dept, phone_last4) → church 매핑 (이름은 마스킹/실명 불일치 가능하므로 제외)
+            # church 컬럼이 비어있으면 교적에서 폴백 매칭
             reg_map = {}
-            for r in reg_rows:
-                key = (r.get("dept") or "", r.get("phone_last4") or "")
-                reg_map[key] = r.get("church") or ""
+            needs_fallback = any(not s.get("church") for s in sp_rows)
+            if needs_fallback:
+                reg_rows = await sb_get(
+                    "church_member_registry?select=dept,phone_last4,church&limit=50000"
+                ) or []
+                for r in reg_rows:
+                    key = (r.get("dept") or "", r.get("phone_last4") or "")
+                    reg_map[key] = r.get("church") or ""
 
             # 결과로 변환
             chats = []
@@ -5860,8 +5861,11 @@ def main():
                 cid = s.get("monitor_chat_id")
                 if not cid or cid in seen_chat_ids:
                     continue
-                key = (s.get("dept") or "", s.get("phone_last4") or "")
-                church = reg_map.get(key, "")
+                # church: 테이블 자체 값 우선, 없으면 교적 폴백
+                church = s.get("church") or ""
+                if not church:
+                    key = (s.get("dept") or "", s.get("phone_last4") or "")
+                    church = reg_map.get(key, "")
 
                 # scope 별 필터
                 if scope_type == "special_church" and scope_church and church != scope_church:
