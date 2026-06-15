@@ -4570,34 +4570,23 @@ async def wednesday_visit_plan_request_job(context: ContextTypes.DEFAULT_TYPE, s
                     logger.warning("특별관리 조회 실패 chat=%s: %s", chat_id, e)
 
                 if sp_target:
-                    # 🚨 특별관리 대책방 — 피드백/심방날짜/심방계획 안내
-                    sp_name = _html.escape(sp_target.get("name", "?"))
-                    msg = (
-                        f"🚨 <b>수요일 알림 — 특별관리 대책방</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"📌 대상자: <b>{sp_name}</b>\n"
-                        f"📅 주차: <b>{week_label_safe}</b>\n\n"
-                        f"<b>🙏 이번 주 다음 항목을 진행해주세요:</b>\n"
-                        f"1️⃣ <b>금주의 피드백</b> 진행\n"
-                        f"2️⃣ <b>심방예정일</b> 정하기\n"
-                        f"3️⃣ <b>심방계획</b> 세우기\n\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"하단 <code>🚨 특별관리결석자</code> 버튼으로 입력하세요."
-                    )
-                else:
-                    # 📋 일반 그룹방 / 개인방 — 간단 안내
-                    msg = (
-                        f"📋 <b>수요일 심방계획 요청</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"📌 담당: <b>{_html.escape(scope_txt)}</b>\n"
-                        f"📅 주차: <b>{week_label_safe}</b>\n\n"
-                        f"<b>🙏 주일까지 다음 작업을 부탁드립니다:</b>\n"
-                        f"1️⃣ 결석자 중 <b>타겟 대상 선정</b>\n"
-                        f"2️⃣ 각 타겟에 대한 <b>심방계획 작성</b>\n"
-                        f"3️⃣ <b>심방 실행 &amp; 기록 업데이트</b>\n\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"하단 <code>📋 결석자 심방</code> 버튼으로 시작하세요."
-                    )
+                    # 🔧 특별관리 대책방은 weekly_reminder_job이 별도 발송하므로 스킵
+                    logger.info("수요일 알림 스킵 (특별관리 대책방 — weekly_reminder_job이 처리): %s", chat_id)
+                    continue
+
+                # 📋 일반 그룹방 / 개인방 — 간단 안내
+                msg = (
+                    f"📋 <b>수요일 심방계획 요청</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"📌 담당: <b>{_html.escape(scope_txt)}</b>\n"
+                    f"📅 주차: <b>{week_label_safe}</b>\n\n"
+                    f"<b>🙏 주일까지 다음 작업을 부탁드립니다:</b>\n"
+                    f"1️⃣ 결석자 중 <b>타겟 대상 선정</b>\n"
+                    f"2️⃣ 각 타겟에 대한 <b>심방계획 작성</b>\n"
+                    f"3️⃣ <b>심방 실행 &amp; 기록 업데이트</b>\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"하단 <code>📋 결석자 심방</code> 버튼으로 시작하세요."
+                )
 
                 # 5) 전송 (HTML → fallback to plain)
                 # 🆕 v6.0: 사용자 요청 — 수요일 알람에는 대시보드 링크 표시 안 함
@@ -5899,7 +5888,7 @@ def main():
             authorized = {r["chat_id"] for r in auth_rows}
             return [c for c in chats if c["chat_id"] in authorized]
 
-        # 일반 그룹방 발송
+        # 일반 그룹방 발송 — 특별관리 대책방도 포함 (1번만 발송)
         qs = "telegram_chat_scope?select=chat_id,chat_title,church,dept,region_name,zone_name&limit=5000"
         if scope_type == "church" and scope_church:
             qs += f"&church=eq.{quote(scope_church)}"
@@ -6065,8 +6054,20 @@ def main():
         # 허용 태그: <b>, <strong>, <i>, <em>, <u>, <s>, <strike>, <code>, <pre>, <a>, <br>
         # 다른 태그는 그대로 출력 (Telegram이 무시) — 위험한 것 없음
         # XSS 위험: 봇은 텍스트만 보내고 HTML 렌더는 Telegram 클라이언트에서만 발생 → 안전
-        # 🆕 특별관리 대상자 대책방엔 다른 prefix
+        # 🔧 타이틀: scope에 따라 교회별 동적 결정
         sc_type = (scope or {}).get("type") or "all"
+        sc_church = (scope or {}).get("church") or ""
+
+        # 🔧 어록: DB에서 읽기 (없으면 기본값)
+        default_quote = "하나님이 누군가를 부르신다는 것은 그 사람이 그럴만한 능력이 있어서가 아니라 그럴만한 능력을 주시겠다는 그런 말이다"
+        try:
+            q_rows = await sb_get("app_settings?key=eq.bc_quote&select=value&limit=1") or []
+            quote = (q_rows[0].get("value") or "").strip() if q_rows else ""
+            if not quote:
+                quote = default_quote
+        except Exception:
+            quote = default_quote
+
         if str(sc_type).startswith("special"):
             prefixed_message = (
                 "🚨 <b>특별관리 안내</b>\n"
@@ -6076,12 +6077,17 @@ def main():
                 "<i>본 메시지는 특별관리 대책방으로 발송됨</i>"
             )
         else:
+            # 교회별 타이틀: 특정 교회 지정 시 교회명, 아니면 지파명
+            if sc_church:
+                title = f"📢 <b>{sc_church} 안내</b>"
+            else:
+                title = "📢 <b>서울야고보지파 안내</b>"
             prefixed_message = (
-                "📢 <b>서울야고보지파 안내</b>\n"
+                f"{title}\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"{message}\n\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                "<i>[총회장님 어록] 하나님이 누군가를 부르신다는 것은 그 사람이 그럴만한 능력이 있어서가 아니라 그럴만한 능력을 주시겠다는 그런 말이다</i>"
+                f"<i>[총회장님 어록] {quote}</i>"
             )
 
         sent = 0
@@ -6124,11 +6130,19 @@ def main():
                 if new_chat_id:
                     # DB 갱신 + 재시도
                     try:
-                        # authorized_chats 테이블의 chat_id 업데이트
+                        # bot_authorized_chats 테이블의 chat_id 업데이트
                         await sb_patch(
-                            f"authorized_chats?chat_id=eq.{cid}",
+                            f"bot_authorized_chats?chat_id=eq.{cid}",
                             {"chat_id": new_chat_id},
                         )
+                        # telegram_chat_scope도 함께 갱신
+                        try:
+                            await sb_patch(
+                                f"telegram_chat_scope?chat_id=eq.{cid}",
+                                {"chat_id": new_chat_id},
+                            )
+                        except Exception:
+                            pass
                         logger.info("[broadcast] migrated %s → %s (DB 갱신)", cid, new_chat_id)
                         migrated_count += 1
                         # 새 chat_id로 즉시 재시도
@@ -6151,7 +6165,7 @@ def main():
                       "Forbidden" in err_str):
                     try:
                         await sb_patch(
-                            f"authorized_chats?chat_id=eq.{cid}",
+                            f"bot_authorized_chats?chat_id=eq.{cid}",
                             {"is_active": False},
                         )
                         logger.info("[broadcast] 비활성화 chat=%s reason=%s", cid, err_str[:80])
