@@ -221,10 +221,12 @@ async def resolve_real_name(
     church: str = None,
     dept: str = None,
     phone_last4: str = None,
+    unique_id: str = None,
 ) -> str:
     """
     마스킹된 이름(예: 김*영)을 교적에서 역조회하여 실제 이름으로 복구.
     매칭 우선순위:
+      0. unique_id 직접 조회 (가장 정확) ← 🆕
       1. church + dept + phone_last4 + 이름 패턴
       2. church + phone_last4 + 이름 패턴
       3. phone_last4 + 이름 패턴
@@ -232,6 +234,17 @@ async def resolve_real_name(
     """
     if not masked_name or not _is_masked_name(masked_name):
         return masked_name
+
+    # 🆕 0순위: unique_id로 교적 직접 조회
+    if unique_id:
+        try:
+            rows = await sb_get(
+                f"church_member_registry?select=name&unique_id=eq.{quote(unique_id)}&limit=1"
+            )
+            if rows and rows[0].get("name"):
+                return rows[0]["name"]
+        except Exception:
+            pass
 
     # 이름 패턴 생성: "김*영" → "^김.영$"
     try:
@@ -340,7 +353,7 @@ async def _get_member_registry_by_church(church: str) -> list:
             # offset/limit 와 Range 헤더 둘 다 시도 — 어느 쪽이든 작동하도록
             path = (
                 f"church_member_registry"
-                f"?select=name,church,dept,region_name,zone_name,phone_last4,classification"
+                f"?select=name,unique_id,church,dept,region_name,zone_name,phone_last4,classification"
                 f"&church=eq.{quote(church)}"
                 f"&order=name.asc"
                 f"&offset={offset}&limit={PAGE}"
@@ -385,15 +398,14 @@ def _is_masked_name_simple(name: str) -> bool:
     return bool(name) and ("*" in name or "ㅇ" in name)
 
 
-def _classify_one(name: str, phone4: str, church: str, members: list) -> str:
+def _classify_one(name: str, phone4: str, church: str, members: list, unique_id: str = None) -> str:
     """1명의 결석자를 교적부와 매칭해 분류('가족'/'가족외'/'일반') 반환.
     
-    매칭 우선순위 (클라이언트 코드와 동일한 로직):
+    매칭 우선순위:
+      0) unique_id 직접 매칭 (가장 정확) ← 🆕
       1) church + name + phone_last4 완전 일치
       2) church + name 일치 (전화 무시)
       3) 마스킹 이름 복구 (church + phone_last4 + 이름 길이/패턴)
-      4) name + phone_last4 일치 (교회 무시)
-      5) name 만 일치 (최후 수단)
     매칭 실패 시 '일반' 반환.
     """
     if not members:
@@ -401,8 +413,15 @@ def _classify_one(name: str, phone4: str, church: str, members: list) -> str:
     cn = (name or "").strip()
     cp = (phone4 or "").strip()
     cc = (church or "").strip()
+    cu = (unique_id or "").strip()
     if not cn:
         return "일반"
+
+    # 🆕 0순위: unique_id 직접 매칭
+    if cu:
+        for m in members:
+            if (m.get("unique_id") or "").strip() == cu:
+                return m.get("classification") or "일반"
 
     # 1차: church + name + phone
     if cc and cp:
@@ -454,6 +473,7 @@ async def classify_absentees(rows: list, church: str) -> list:
                 r.get("phone_last4", "") or "",
                 r.get("church", "") or church,
                 members,
+                r.get("unique_id", "") or "",
             )
         except Exception as e:
             logger.debug("classify_one 실패 name=%r: %s", r.get("name"), e)
@@ -722,7 +742,7 @@ async def fetch_absentees_by_region(week_key: str, church: str, dept: str, regio
     # REST 폴백
     path = (
         f"weekly_visit_targets"
-        f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
+        f"?select=row_id,name,unique_id,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
         f"&week_key=eq.{quote(week_key)}"
         f"&church=eq.{quote(church)}"
         f"&dept=eq.{quote(dept)}"
@@ -763,7 +783,7 @@ async def fetch_absentees_by_zone(week_key: str, church: str, dept: str, zone: s
     candidates = zone_candidates(zone)
     base = (
         f"weekly_visit_targets"
-        f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
+        f"?select=row_id,name,unique_id,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
         f"&week_key=eq.{quote(week_key)}"
         f"&church=eq.{quote(church)}"
         f"&dept=eq.{quote(dept)}"
@@ -828,7 +848,7 @@ async def fetch_absentees_4plus(week_key: str, church: str, dept: str):
     # REST: 연속결석 ≥ 1 전부 (가족/가족외 후보 포함)
     path = (
         f"weekly_visit_targets"
-        f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
+        f"?select=row_id,name,unique_id,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
         f"&week_key=eq.{quote(week_key)}"
         f"&church=eq.{quote(church)}"
         f"&dept=eq.{quote(dept)}"
@@ -1917,7 +1937,7 @@ async def scope_filter_absentees(chat_id: int, week_key: str) -> list:
     # scope 범위별 path 구성
     path = (
         f"weekly_visit_targets"
-        f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
+        f"?select=row_id,name,unique_id,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
         f"&week_key=eq.{quote(week_key)}"
         f"&church=eq.{quote(s['church'])}"
     )
@@ -2928,7 +2948,7 @@ async def _fetch_scoped(week_key, church, dept, region, zone, flow):
     """
     base = (
         f"weekly_visit_targets"
-        f"?select=row_id,name,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
+        f"?select=row_id,name,unique_id,phone_last4,church,dept,region_name,zone_name,consecutive_absent_count"
         f"&week_key=eq.{quote(week_key)}"
         f"&church=eq.{quote(church)}"
     )
