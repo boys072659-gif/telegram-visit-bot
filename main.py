@@ -224,18 +224,14 @@ async def resolve_real_name(
     unique_id: str = None,
 ) -> str:
     """
-    마스킹된 이름(예: 김*영)을 교적에서 역조회하여 실제 이름으로 복구.
-    매칭 우선순위:
-      0. unique_id 직접 조회 (가장 정확) ← 🆕
-      1. church + dept + phone_last4 + 이름 패턴
-      2. church + phone_last4 + 이름 패턴
-      3. phone_last4 + 이름 패턴
+    마스킹된 이름(예: 김*영)을 unique_id로 교적에서 역조회하여 실제 이름으로 복구.
+    🎯 unique_id 기반 식별만 사용 (phone 기반 fallback 제거)
     매칭 실패 시 원래 마스킹 이름 반환.
     """
     if not masked_name or not _is_masked_name(masked_name):
         return masked_name
 
-    # 🆕 0순위: unique_id로 교적 직접 조회
+    # unique_id로 교적 직접 조회
     if unique_id:
         try:
             rows = await sb_get(
@@ -243,65 +239,6 @@ async def resolve_real_name(
             )
             if rows and rows[0].get("name"):
                 return rows[0]["name"]
-        except Exception:
-            pass
-
-    # 이름 패턴 생성: "김*영" → "^김.영$"
-    try:
-        pattern = '^' + _re_name.escape(masked_name).replace(r'\*', '.').replace(r'\_', '.') + '$'
-    except Exception:
-        return masked_name
-
-    # 1차: 교회 + 부서 + 전화뒷4 일치
-    params = []
-    if church:     params.append(f"church=eq.{quote(church)}")
-    if dept:       params.append(f"dept=eq.{quote(dept)}")
-    if phone_last4:params.append(f"phone_last4=eq.{quote(phone_last4)}")
-    params.append("limit=30")
-
-    if len(params) >= 3:  # 최소 교회+뭔가+전화 또는 뭔가 2개+전화
-        try:
-            rows = await sb_get(f"church_member_registry?select=name&" + "&".join(params))
-            for r in rows or []:
-                nm = r.get("name", "")
-                if nm and _re_name.match(pattern, nm):
-                    return nm
-        except Exception:
-            pass
-
-    # 2차: 교회 + 전화뒷4
-    if church and phone_last4:
-        try:
-            rows = await sb_get(
-                f"church_member_registry?select=name"
-                f"&church=eq.{quote(church)}&phone_last4=eq.{quote(phone_last4)}&limit=30"
-            )
-            for r in rows or []:
-                nm = r.get("name", "")
-                if nm and _re_name.match(pattern, nm):
-                    return nm
-        except Exception:
-            pass
-
-    # 3차: 전화뒷4만 (마지막 수단)
-    if phone_last4:
-        try:
-            rows = await sb_get(
-                f"church_member_registry?select=name,church"
-                f"&phone_last4=eq.{quote(phone_last4)}&limit=30"
-            )
-            # 교회 일치하면 우선 반환
-            for r in rows or []:
-                nm = r.get("name", "")
-                if not nm: continue
-                if not _re_name.match(pattern, nm): continue
-                if church and r.get("church") == church:
-                    return nm
-            # 교회 안 맞아도 패턴 일치면 반환
-            for r in rows or []:
-                nm = r.get("name", "")
-                if nm and _re_name.match(pattern, nm):
-                    return nm
         except Exception:
             pass
 
@@ -400,60 +337,20 @@ def _is_masked_name_simple(name: str) -> bool:
 
 def _classify_one(name: str, phone4: str, church: str, members: list, unique_id: str = None) -> str:
     """1명의 결석자를 교적부와 매칭해 분류('가족'/'가족외'/'일반') 반환.
-    
-    매칭 우선순위:
-      0) unique_id 직접 매칭 (가장 정확) ← 🆕
-      1) church + name + phone_last4 완전 일치
-      2) church + name 일치 (전화 무시)
-      3) 마스킹 이름 복구 (church + phone_last4 + 이름 길이/패턴)
+    🎯 unique_id 기반 식별만 사용 (phone 기반 fallback 제거)
     매칭 실패 시 '일반' 반환.
     """
     if not members:
         return "일반"
-    cn = (name or "").strip()
-    cp = (phone4 or "").strip()
-    cc = (church or "").strip()
     cu = (unique_id or "").strip()
-    if not cn:
+    if not cu:
         return "일반"
 
-    # 🆕 0순위: unique_id 직접 매칭
-    if cu:
-        for m in members:
-            if (m.get("unique_id") or "").strip() == cu:
-                return m.get("classification") or "일반"
-
-    # 1차: church + name + phone
-    if cc and cp:
-        for m in members:
-            if m.get("name") == cn and (m.get("phone_last4") or "") == cp:
-                return m.get("classification") or "일반"
-    # 2차: church + name (전화 무시) — members 는 이미 church 필터됨
+    # unique_id 직접 매칭
     for m in members:
-        if m.get("name") == cn:
+        if (m.get("unique_id") or "").strip() == cu:
             return m.get("classification") or "일반"
 
-    # 3차: 마스킹 이름 복구 ('박*연' 형태)
-    if _is_masked_name_simple(cn):
-        parts = re.split(r"[*ㅇ]", cn)
-        head = parts[0] if parts else ""
-        tail = parts[-1] if parts else ""
-        for m in members:
-            mn = m.get("name") or ""
-            if not mn or len(mn) != len(cn):
-                continue
-            if not mn.startswith(head) or not mn.endswith(tail):
-                continue
-            # 전화도 일치하면 더 신뢰
-            if cp and (m.get("phone_last4") or "") == cp:
-                return m.get("classification") or "일반"
-        # 전화 매칭 실패 시 패턴만으로 한번 더
-        for m in members:
-            mn = m.get("name") or ""
-            if mn and len(mn) == len(cn) and mn.startswith(head) and mn.endswith(tail):
-                return m.get("classification") or "일반"
-
-    # 4·5차: 교회 무시 매칭은 다른 교회 동명이인 위험 — 여기서는 시도 안 함
     return "일반"
 
 
