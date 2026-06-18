@@ -5744,6 +5744,26 @@ def main():
         scope_church = (scope or {}).get("church")
         scope_dept = (scope or {}).get("dept")
 
+        # 🆕 specific: 명시된 chat_id 목록만 발송 (개별 카드 메시지)
+        if scope_type == "specific":
+            raw_ids = (scope or {}).get("chat_ids") or []
+            try:
+                chat_ids = [int(x) for x in raw_ids if x is not None and str(x).strip()]
+            except Exception:
+                chat_ids = []
+            if not chat_ids:
+                return []
+            chat_ids_str = ",".join(str(c) for c in chat_ids)
+            # 봇 활성 권한 체크
+            auth_rows = await sb_get(
+                f"bot_authorized_chats?select=chat_id&chat_id=in.({chat_ids_str})&is_active=eq.true&limit=5000"
+            ) or []
+            authorized = {r["chat_id"] for r in auth_rows}
+            return [{"chat_id": cid, "chat_title": f"chat_{cid}",
+                     "church": None, "dept": None,
+                     "region_name": None, "zone_name": None}
+                    for cid in chat_ids if cid in authorized]
+
         # 🆕 특별관리 대상자 대책방 발송
         if scope_type in ("special", "special_church", "special_dept"):
             sp_qs = "special_management_targets?select=name,dept,phone_last4,monitor_chat_id,region_name,zone_name,church&monitor_chat_id=not.is.null&limit=5000"
