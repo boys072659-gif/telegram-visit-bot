@@ -5975,12 +5975,13 @@ def main():
         sc_type = (scope or {}).get("type") or "all"
         sc_church = (scope or {}).get("church") or ""
 
-        # 🔧 어록: DB에서 읽기 (없으면 기본값)
+        # 🔧 어록: RPC로 읽기 (anon SELECT 차단 대응)
         default_quote = "하나님이 누군가를 부르신다는 것은 그 사람이 그럴만한 능력이 있어서가 아니라 그럴만한 능력을 주시겠다는 그런 말이다"
         try:
-            q_rows = await sb_get("app_settings?key=eq.bc_quote&select=value&limit=1") or []
-            quote = (q_rows[0].get("value") or "").strip() if q_rows else ""
-            if not quote:
+            q_val = await sb_rpc("get_bc_quote", {}) or ""
+            if isinstance(q_val, str) and q_val.strip():
+                quote = q_val.strip()
+            else:
                 quote = default_quote
         except Exception:
             quote = default_quote
