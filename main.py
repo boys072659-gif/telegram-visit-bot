@@ -27,7 +27,13 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     filters,
+    TypeHandler,
+    ApplicationHandlerStop,
 )
+
+# 🆕 C8: 사용자 레이트 리밋용
+from collections import defaultdict
+from time import time as _now_ts
 
 # ── 환경변수 ──────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -43,6 +49,31 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+# ════════════════════════════════════════════════════════════
+# 🆕 C8: 사용자 레이트 리밋 (남용/공격 방어)
+#   - 동일 user_id가 60초에 30회 초과 요청 시 차단
+#   - 일반 사용자는 1초에 1번 누를 일이 없어 영향 없음
+#   - 자동화 공격, 토큰 무차별 대입 시도, 봇 폭주 차단용
+# ════════════════════════════════════════════════════════════
+_USER_REQUEST_LOG: dict[int, list[float]] = defaultdict(list)
+_RATE_LIMIT_WINDOW = 60   # 60초 윈도우
+_RATE_LIMIT_MAX = 30      # 사용자당 60초에 30회까지
+
+def check_rate_limit(user_id: int) -> bool:
+    """레이트 리밋 통과 시 True, 차단 시 False."""
+    if not user_id:
+        return True  # 익명 콜백 등은 통과
+    now = _now_ts()
+    log = _USER_REQUEST_LOG[user_id]
+    # 60초 이전 기록 제거
+    while log and log[0] < now - _RATE_LIMIT_WINDOW:
+        log.pop(0)
+    if len(log) >= _RATE_LIMIT_MAX:
+        return False
+    log.append(now)
+    return True
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -5557,6 +5588,15 @@ MINIAPP_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mi
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # 🆕 C8: 모든 update 진입 시 레이트 리밋 체크 (group=-1로 최우선 실행)
+    #   초과 사용자는 무반응 처리 → 다른 핸들러 실행 차단
+    async def _rate_limit_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if user and not check_rate_limit(user.id):
+            logger.warning("rate_limit blocked user_id=%s", user.id)
+            raise ApplicationHandlerStop  # 다른 핸들러 실행 차단
+    app.add_handler(TypeHandler(Update, _rate_limit_gate), group=-1)
 
     # 🛡 글로벌 에러 핸들러 — Markdown 파싱 실패 자동 감지/재시도
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
