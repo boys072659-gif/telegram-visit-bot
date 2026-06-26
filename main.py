@@ -15,6 +15,7 @@ import os
 import re
 import json
 import logging
+import hmac
 import httpx
 from urllib.parse import quote
 from datetime import datetime, time as dtime, timezone, timedelta
@@ -43,6 +44,18 @@ SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
 KST = timezone(timedelta(hours=9))
 WEEKLY_REMINDER_HOUR = int(os.environ.get("WEEKLY_REMINDER_HOUR", "19"))
 WEEKLY_REMINDER_MIN  = int(os.environ.get("WEEKLY_REMINDER_MIN", "0"))
+
+# 🆕 C4-f: 비상 관리자 user_id (.env로 설정)
+#   - 평소 0(또는 빈값) — DB의 bot_admins 테이블만 사용
+#   - lockout/DB 장애 시 .env에 본인 텔레그램 user_id를 넣으면 복원 가능
+#   - 봇 재시작 후 그 user_id는 항상 admin 권한 행사 가능
+EMERGENCY_ADMIN_USER_ID = int(os.environ.get("EMERGENCY_ADMIN_USER_ID", "0") or "0")
+
+# 🆕 C12: Telegram webhook 보안 토큰
+#   - 비어있으면 → secret_token 미사용 (기존 동작 유지, 호환성)
+#   - 값이 있으면 → set_webhook에 등록 + 들어오는 요청 헤더 검증
+#   - 생성 방법: python -c "import secrets; print(secrets.token_urlsafe(32))"
+WEBHOOK_SECRET_TOKEN = os.environ.get("WEBHOOK_SECRET_TOKEN", "")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,7 +95,14 @@ HEADERS = {
     "Prefer": "return=representation",
 }
 
-CHURCHES = ["서울교회", "포천교회", "구리교회", "동대문교회", "의정부교회"]
+# 🆕 C10: 교회 목록 외부화 (.env의 CHURCH_LIST에서 읽음, 쉼표 구분)
+#   - 코드가 Public 레포에 노출되어도 교회 목록은 별도 환경변수라 함께 노출 안 됨
+#   - Cloud Run 환경변수에 CHURCH_LIST=서울교회,포천교회,... 형태로 설정
+_CHURCH_LIST_RAW = os.environ.get("CHURCH_LIST", "")
+CHURCHES = [x.strip() for x in _CHURCH_LIST_RAW.split(",") if x.strip()]
+if not CHURCHES:
+    # 환경변수 미설정 시 경고만 (봇은 시작은 됨, 교회 선택 메뉴만 빈 목록)
+    logging.warning("⚠️ CHURCH_LIST 환경변수 미설정 — 교회 선택 메뉴가 빈 목록입니다")
 DEPTS    = ["자문회", "장년회", "부녀회", "청년회"]
 
 # ── 심방 입력 7단계 ────────────────────────────────────────────────────────────
@@ -1668,6 +1688,11 @@ async def is_bot_admin_user(user_id: int) -> bool:
     """이 user_id 가 봇 관리자인지 확인."""
     if not user_id:
         return False
+    # 🆕 C4-f: 비상 관리자 — DB 장애·lockout 시에도 작동
+    #   .env의 EMERGENCY_ADMIN_USER_ID와 일치하면 DB 조회 없이 admin 인정
+    #   평소엔 DB 조회로 작동, 비상시에만 .env로 복구 가능
+    if EMERGENCY_ADMIN_USER_ID and user_id == EMERGENCY_ADMIN_USER_ID:
+        return True
     try:
         result = await sb_rpc("is_bot_admin", {"p_user_id": user_id})
         if isinstance(result, bool):
@@ -1680,6 +1705,10 @@ async def is_bot_admin_user(user_id: int) -> bool:
         return False
     except Exception as e:
         logger.warning("is_bot_admin 실패: %s", e)
+        # 🆕 C4-f: DB 조회 실패해도 비상 관리자는 작동
+        if EMERGENCY_ADMIN_USER_ID and user_id == EMERGENCY_ADMIN_USER_ID:
+            logger.warning("DB 장애 — 비상 관리자 권한으로 작동: user_id=%s", user_id)
+            return True
         return False
 
 
@@ -5685,6 +5714,13 @@ def main():
 
     async def webhook_handler(request):
         """텔레그램 웹훅 수신 → PTB 큐에 업데이트 투입"""
+        # 🆕 C12: secret_token 헤더 검증 — 가짜 webhook 호출 차단
+        #   WEBHOOK_SECRET_TOKEN이 설정된 경우만 검증 (빈 값이면 통과)
+        if WEBHOOK_SECRET_TOKEN:
+            incoming = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if not hmac.compare_digest(incoming, WEBHOOK_SECRET_TOKEN):
+                logger.warning("webhook invalid secret_token from %s", request.remote)
+                return web.Response(status=403, text="forbidden")
         try:
             data = await request.json()
         except Exception:
@@ -6438,8 +6474,18 @@ def main():
         # 웹훅 등록
         try:
             await app.bot.delete_webhook(drop_pending_updates=True)
-            await app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-            logger.info("✅ webhook registered: %s", webhook_url)
+            # 🆕 C12: secret_token 같이 등록 (Telegram이 webhook 호출 시 헤더에 포함시킴)
+            #   WEBHOOK_SECRET_TOKEN 빈 값이면 secret_token 미사용 (기존 동작)
+            if WEBHOOK_SECRET_TOKEN:
+                await app.bot.set_webhook(
+                    url=webhook_url,
+                    secret_token=WEBHOOK_SECRET_TOKEN,
+                    drop_pending_updates=True,
+                )
+                logger.info("✅ webhook registered with secret_token: %s", webhook_url)
+            else:
+                await app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+                logger.info("✅ webhook registered (no secret_token): %s", webhook_url)
         except Exception as e:
             logger.exception("set_webhook failed: %s", e)
 
